@@ -2,6 +2,7 @@ use core::num::NonZeroU16;
 use std::sync::Arc;
 
 use ironrdp::cliprdr::backend::{ClipboardMessage, CliprdrBackendFactory};
+use ironrdp::cliprdr::pdu::FileDescriptor;
 use ironrdp::connector::connection_activation::ConnectionActivationState;
 use ironrdp::connector::{ConnectionResult, ConnectorResult};
 use ironrdp::displaycontrol::client::DisplayControlClient;
@@ -63,6 +64,7 @@ pub enum RdpInputEvent {
     FastPath(SmallVec<[FastPathInputEvent; 2]>),
     Close,
     Clipboard(ClipboardMessage),
+    ClipboardFileCopy(Vec<FileDescriptor>),
     SendDvcMessages {
         channel_id: u32,
         messages: Vec<SvcMessage>,
@@ -670,6 +672,20 @@ async fn active_session(
                             }
                         } else  {
                             warn!("Clipboard event received, but Cliprdr is not available");
+                            Vec::new()
+                        }
+                    }
+                    RdpInputEvent::ClipboardFileCopy(files) => {
+                        if let Some(cliprdr) = active_stage
+                            .get_svc_processor_mut::<cliprdr::CliprdrClient>()
+                        {
+                            let svc_messages = cliprdr
+                                .initiate_file_copy(files)
+                                .map_err(|e| session::custom_err!("CLIPRDR", e))?;
+                            let frame = active_stage.process_svc_processor_messages(svc_messages)?;
+                            vec![ActiveStageOutput::ResponseFrame(frame)]
+                        } else {
+                            warn!("File clipboard event received, but Cliprdr is not available");
                             Vec::new()
                         }
                     }
