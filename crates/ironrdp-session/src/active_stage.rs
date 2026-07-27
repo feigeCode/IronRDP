@@ -200,6 +200,30 @@ impl ActiveStage {
         self.fast_path_processor = processor;
     }
 
+    /// Rebuilds the Fast-Path processor after a Deactivation-Reactivation Sequence.
+    ///
+    /// Bulk compression history belongs to the transport session and remains valid
+    /// across reactivation, so it must be transferred to the new processor.
+    pub fn rebuild_fastpath_processor(
+        &mut self,
+        io_channel_id: u16,
+        user_channel_id: u16,
+        share_id: u32,
+        enable_server_pointer: bool,
+        pointer_software_rendering: bool,
+    ) {
+        let bulk_decompressor = self.fast_path_processor.take_bulk_decompressor();
+        self.fast_path_processor = fast_path::ProcessorBuilder {
+            io_channel_id,
+            user_channel_id,
+            share_id,
+            enable_server_pointer,
+            pointer_software_rendering,
+            bulk_decompressor,
+        }
+        .build();
+    }
+
     /// Updates the share_id used by the x224 processor for encoding ShareDataPdu.
     /// Must be called during Deactivation-Reactivation if the server assigns a new share_id.
     pub fn set_share_id(&mut self, share_id: u32) {

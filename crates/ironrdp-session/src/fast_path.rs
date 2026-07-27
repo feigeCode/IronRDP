@@ -55,6 +55,10 @@ impl Processor {
         self.mouse_pos_update = Some((x, y));
     }
 
+    pub(crate) fn take_bulk_decompressor(&mut self) -> Option<BulkCompressor> {
+        self.bulk_decompressor.take()
+    }
+
     /// Process input fast path frame and return list of updates.
     pub fn process(
         &mut self,

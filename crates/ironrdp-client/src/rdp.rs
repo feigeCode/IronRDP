@@ -15,7 +15,7 @@ use ironrdp::graphics::pointer::DecodedPointer;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::{PduResult, pdu_other_err};
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult, fast_path};
+use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult};
 use ironrdp::svc::SvcMessage;
 use ironrdp::{cliprdr, connector, rdpdr, rdpsnd, session};
 use ironrdp_core::WriteBuf;
@@ -810,16 +810,12 @@ async fn active_session(
                             // Update image size with the new desktop size.
                             image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
                             // Update the active stage with the new channel IDs and pointer settings.
-                            active_stage.set_fastpath_processor(
-                                fast_path::ProcessorBuilder {
-                                    io_channel_id,
-                                    user_channel_id,
-                                    share_id,
-                                    enable_server_pointer,
-                                    pointer_software_rendering,
-                                    bulk_decompressor: None,
-                                }
-                                .build(),
+                            active_stage.rebuild_fastpath_processor(
+                                io_channel_id,
+                                user_channel_id,
+                                share_id,
+                                enable_server_pointer,
+                                pointer_software_rendering,
                             );
                             active_stage.set_share_id(share_id);
                             active_stage.set_enable_server_pointer(enable_server_pointer);
