@@ -23,6 +23,7 @@ use crate::{SessionError, SessionErrorExt as _, SessionResult, custom_err, reaso
 
 #[cfg(test)]
 mod tests {
+    use ironrdp_graphics::rdp6::{BitmapStreamEncoder, RgbChannels};
     use ironrdp_pdu::bitmap::{BitmapData, Compression};
 
     use super::*;
@@ -76,6 +77,62 @@ mod tests {
         assert_eq!(pixel(1, 1), [1, 2, 3, 255]);
         assert_eq!(pixel(2, 1), [4, 5, 6, 255]);
         assert_eq!(pixel(3, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rdp6_bitmap_update_flips_bottom_up_scanlines_before_blitting() {
+        for rle in [false, true] {
+            let mut processor = ProcessorBuilder {
+                io_channel_id: 0,
+                user_channel_id: 0,
+                share_id: 0,
+                enable_server_pointer: false,
+                pointer_software_rendering: false,
+                bulk_decompressor: None,
+            }
+            .build();
+            let mut image = DecodedImage::new(PixelFormat::RgbA32, 2, 2);
+
+            // Keep the first stream row distinct from the last so the row flip is observable.
+            let wire_rgb = [
+                30, 31, 32, 40, 41, 42, // first stream row
+                10, 11, 12, 20, 21, 22, // last stream row
+            ];
+            let mut bitmap_data = vec![0; wire_rgb.len() + 8];
+            let written = BitmapStreamEncoder::new(2, 2)
+                .encode_bitmap::<RgbChannels>(&wire_rgb, &mut bitmap_data, rle)
+                .unwrap();
+
+            let bitmap_update = BitmapUpdateData {
+                rectangles: vec![BitmapData {
+                    rectangle: InclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: 1,
+                        bottom: 1,
+                    },
+                    width: 2,
+                    height: 2,
+                    bits_per_pixel: 32,
+                    compression_flags: Compression::BITMAP_COMPRESSION,
+                    compressed_data_header: None,
+                    bitmap_data: &bitmap_data[..written],
+                }],
+            };
+
+            processor.process_bitmap_update(&mut image, bitmap_update).unwrap();
+
+            let pixel = |x: usize, y: usize| -> [u8; 4] {
+                let offset = (y * usize::from(image.width()) + x) * 4;
+                image.data()[offset..offset + 4]
+                    .try_into()
+                    .expect("pixel has four channels")
+            };
+            assert_eq!(pixel(0, 0), [10, 11, 12, 255], "RLE: {rle}");
+            assert_eq!(pixel(1, 0), [20, 21, 22, 255], "RLE: {rle}");
+            assert_eq!(pixel(0, 1), [30, 31, 32, 255], "RLE: {rle}");
+            assert_eq!(pixel(1, 1), [40, 41, 42, 255], "RLE: {rle}");
+        }
     }
 }
 
@@ -296,8 +353,10 @@ impl Processor {
                         usize::from(update.width),
                         usize::from(update.height),
                     ) {
-                        // The RDP 6 decoder writes its planes in row-major (top-down) order.
-                        Ok(()) => image.apply_rgb24(&buf, &bitmap_rectangle, update.width, false)?,
+                        // RDP6 bitmap streams are bottom-up, so reverse them while decoding to
+                        // keep the framebuffer top-down. This matches FreeRDP's GDI frontend,
+                        // which passes `vFlip = TRUE` to its planar bitmap decoder.
+                        Ok(()) => image.apply_rgb24(&buf, &bitmap_rectangle, update.width, true)?,
                         Err(err) => {
                             warn!("Invalid RDP6_BITMAP_STREAM: {err}");
                             update.rectangle.clone()
