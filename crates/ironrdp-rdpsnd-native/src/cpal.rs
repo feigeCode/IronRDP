@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-use cpal::traits::{DeviceTrait as _, HostTrait as _};
+use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use ironrdp_error::bail;
 use ironrdp_rdpsnd::client::RdpsndClientHandler;
@@ -245,6 +245,9 @@ impl DecodeStream {
             .map_err(|e| {
                 RdpsndNativeError::new("building cpal output stream", RdpsndNativeErrorKind::StreamBuild).with_source(e)
             })?;
+        stream.play().map_err(|e| {
+            RdpsndNativeError::new("starting cpal output stream", RdpsndNativeErrorKind::StreamPlay).with_source(e)
+        })?;
 
         Ok(Self {
             _dec_thread: dec_thread,

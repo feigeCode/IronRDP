@@ -5,7 +5,6 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::Context as _;
-use cpal::traits::StreamTrait as _;
 use ironrdp_rdpsnd::pdu::{AudioFormat, WaveFormat};
 use ironrdp_rdpsnd_native::cpal::DecodeStream;
 use tracing::debug;
@@ -43,7 +42,7 @@ fn main() -> anyhow::Result<()> {
         data: None,
     };
     let (tx, rx) = mpsc::channel();
-    let stream = DecodeStream::new(&rx_format, rx)?;
+    let _stream = DecodeStream::new(&rx_format, rx)?;
 
     let producer = thread::spawn(move || {
         let data_chunks = vec![vec![1u8, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
@@ -54,7 +53,6 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    stream.stream().play()?;
     thread::sleep(Duration::from_secs(3));
     let _ = producer.join();
 
