@@ -821,6 +821,9 @@ async fn consume_output(
                     info!(width, height, "Session connected");
                 }
             }
+            RdpOutputEvent::ImageRegion { .. } => {
+                debug!("Ignored dirty-region output because the daemon uses full-frame mode");
+            }
             RdpOutputEvent::ConnectionFailure(error) => {
                 guard.state = ConnState::Failed;
                 guard.error = Some(format!("{error}"));

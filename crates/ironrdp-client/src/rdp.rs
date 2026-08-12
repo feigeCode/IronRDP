@@ -46,6 +46,9 @@ use ironrdp_dvc_pipe_proxy::DvcNamedPipeProxy;
 use ironrdp_rdpsnd_native::cpal;
 
 use crate::config::{Config, RDCleanPathConfig, Transport};
+use crate::graphics_output::{GraphicsOutputState, full_frame_event};
+
+pub use crate::graphics_output::{GraphicsOutputMode, RdpImageRegion};
 
 // ── Public event types ────────────────────────────────────────────────────────
 
@@ -72,6 +75,13 @@ pub enum RdpOutputEvent {
         buffer: Vec<u32>,
         width: NonZeroU16,
         height: NonZeroU16,
+    },
+    /// A packed BGRA dirty rectangle following a complete [`Self::Image`] base frame.
+    ImageRegion {
+        bgra: Vec<u8>,
+        width: NonZeroU16,
+        height: NonZeroU16,
+        region: RdpImageRegion,
     },
     ConnectionFailure(ironrdp_connector::ConnectorError),
     PointerDefault,
@@ -283,6 +293,7 @@ pub struct RdpClient {
     clipboard_event_receiver: mpsc::UnboundedReceiver<RdpInputEvent>,
     close_receiver: watch::Receiver<bool>,
     graceful_close_receiver: watch::Receiver<bool>,
+    graphics_output_mode: GraphicsOutputMode,
     #[cfg(feature = "clipboard")]
     cliprdr_backend_factory: Option<Box<dyn CliprdrBackendFactory + Send>>,
 }
@@ -304,6 +315,7 @@ impl RdpClient {
             clipboard_event_receiver,
             close_receiver,
             graceful_close_receiver,
+            graphics_output_mode: GraphicsOutputMode::default(),
             #[cfg(feature = "clipboard")]
             cliprdr_backend_factory: None,
         }
@@ -315,6 +327,13 @@ impl RdpClient {
     #[must_use]
     pub fn with_cliprdr_backend_factory(mut self, factory: Box<dyn CliprdrBackendFactory + Send>) -> Self {
         self.cliprdr_backend_factory = Some(factory);
+        self
+    }
+
+    /// Selects whether graphics updates contain full framebuffer snapshots or dirty regions.
+    #[must_use]
+    pub fn with_graphics_output_mode(mut self, mode: GraphicsOutputMode) -> Self {
+        self.graphics_output_mode = mode;
         self
     }
 
@@ -493,6 +512,7 @@ impl RdpClient {
                 &mut self.close_receiver,
                 &mut self.graceful_close_receiver,
                 self.config.fake_events_interval,
+                self.graphics_output_mode,
             )
             .await
             {
@@ -1142,12 +1162,14 @@ async fn active_session(
     close_receiver: &mut watch::Receiver<bool>,
     graceful_close_receiver: &mut watch::Receiver<bool>,
     fake_events_interval: Option<Duration>,
+    graphics_output_mode: GraphicsOutputMode,
 ) -> SessionResult<RdpControlFlow> {
     let (mut reader, mut writer) = split_tokio_framed(framed);
     let desktop_size = connection_result.desktop_size;
     let mut refresh_rect_support = connection_result.refresh_rect_support;
     let mut suppress_output_support = connection_result.suppress_output_support;
     let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+    let mut graphics_output = GraphicsOutputState::new(graphics_output_mode);
 
     // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
     let activation_factory = connection_result.activation_factory;
@@ -1195,7 +1217,10 @@ async fn active_session(
 
     let disconnect_reason = 'outer: loop {
         let resize_deadline = resize_queue.deadline();
+        let graphics_flush_deadline = graphics_output.next_flush_deadline();
+        let mut graphics_flush_due = false;
         let mut malformed_bitmap_redraw_queued = false;
+        let mut discard_dirty_graphics_updates = false;
         let clipboard_event = async {
             #[cfg(feature = "clipboard")]
             {
@@ -1226,6 +1251,8 @@ async fn active_session(
                     trace!(?action, frame_length = payload.len(), "Frame received");
                     let mut outputs = active_stage.process(&mut image, action, &payload)?;
                     if active_stage.take_bitmap_recovery_request() {
+                        graphics_output.reset();
+                        discard_dirty_graphics_updates = true;
                         let redraw_frames = active_stage.request_full_redraw(
                             image.width(),
                             image.height(),
@@ -1361,6 +1388,15 @@ async fn active_session(
                     reason,
                 });
                 }
+                _ = async {
+                match graphics_flush_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => core::future::pending().await,
+                }
+                } => {
+                    graphics_flush_due = true;
+                    Vec::new()
+                }
                 _ = async { match fake_events_interval.as_mut() {
                 Some(interval) => interval.tick().await,
                 None => core::future::pending().await,
@@ -1384,6 +1420,21 @@ async fn active_session(
             }
         };
 
+        let mut pending_graphics_event = None;
+        if graphics_output.mode() == GraphicsOutputMode::DirtyRegions && !discard_dirty_graphics_updates {
+            for output in &outputs {
+                if let ActiveStageOutput::GraphicsUpdate(region) = output {
+                    graphics_output.queue_region(&image, region.clone());
+                }
+            }
+
+            pending_graphics_event = if graphics_flush_due {
+                graphics_output.take_pending_event(&image)?
+            } else {
+                graphics_output.take_immediate_event(&image)?
+            };
+        }
+
         for out in outputs {
             match out {
                 ActiveStageOutput::AutoReconnectCookie(_cookie) => {
@@ -1401,29 +1452,19 @@ async fn active_session(
                     };
                     result.map_err(|e| ironrdp_session::custom_err!("write response", e))?;
                 }
-                ActiveStageOutput::GraphicsUpdate(_region) => {
-                    let buffer: Vec<u32> = image
-                        .data()
-                        .chunks_exact(4)
-                        .map(|pixel| {
-                            let r = pixel[0];
-                            let g = pixel[1];
-                            let b = pixel[2];
-                            u32::from_be_bytes([0, r, g, b])
-                        })
-                        .collect();
-                    if !send_active_output_event(
-                        output_event_sender,
-                        RdpOutputEvent::Image {
-                            buffer,
-                            width: NonZeroU16::new(image.width())
-                                .ok_or_else(|| ironrdp_session::general_err!("width is zero"))?,
-                            height: NonZeroU16::new(image.height())
-                                .ok_or_else(|| ironrdp_session::general_err!("height is zero"))?,
-                        },
-                        close_receiver,
-                    )
-                    .await?
+                ActiveStageOutput::GraphicsUpdate(_region)
+                    if graphics_output.mode() == GraphicsOutputMode::FullFrame =>
+                {
+                    if !send_active_output_event(output_event_sender, full_frame_event(&image)?, close_receiver).await?
+                    {
+                        return Ok(RdpControlFlow::TerminatedGracefully(
+                            GracefulDisconnectReason::UserInitiated,
+                        ));
+                    }
+                }
+                ActiveStageOutput::GraphicsUpdate(_) => {
+                    if let Some(graphics_event) = pending_graphics_event.take()
+                        && !send_active_output_event(output_event_sender, graphics_event, close_receiver).await?
                     {
                         return Ok(RdpControlFlow::TerminatedGracefully(
                             GracefulDisconnectReason::UserInitiated,
@@ -1523,6 +1564,7 @@ async fn active_session(
                     // Deactivation-Reactivation Sequence:
                     // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                     debug!("Executing Deactivation-Reactivation Sequence");
+                    graphics_output.reset();
                     let mut connection_activation = activation_factory.create();
                     let mut buf = WriteBuf::new();
                     'activation_seq: loop {
@@ -1611,6 +1653,14 @@ async fn active_session(
                 }
                 ActiveStageOutput::Terminate(reason) => break 'outer reason,
             }
+        }
+
+        if let Some(graphics_event) = pending_graphics_event
+            && !send_active_output_event(output_event_sender, graphics_event, close_receiver).await?
+        {
+            return Ok(RdpControlFlow::TerminatedGracefully(
+                GracefulDisconnectReason::UserInitiated,
+            ));
         }
 
         if malformed_bitmap_redraw_queued

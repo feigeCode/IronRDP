@@ -493,6 +493,9 @@ impl RpcApp {
 
                 window.request_redraw();
             }
+            RdpOutputEvent::ImageRegion { .. } => {
+                debug!("Ignored dirty-region output because the viewer uses full-frame mode");
+            }
             RdpOutputEvent::ConnectionFailure(error) => {
                 error!(?error);
                 eprintln!("Connection error: {}", error.report().with_locations());

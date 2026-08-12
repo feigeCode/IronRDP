@@ -10,6 +10,8 @@
 pub mod config;
 pub mod rdp;
 
+mod graphics_output;
+
 #[cfg(all(windows, feature = "clipboard"))]
 mod clipboard;
 

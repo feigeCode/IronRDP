@@ -7104,6 +7104,9 @@ impl Control {
                                                     },
                                                 );
                                             }
+                                            RdpOutputEvent::ImageRegion { .. } => {
+                                                trace_host_call("RdpWorker::ImageRegionIgnored");
+                                            }
                                             RdpOutputEvent::Connected => {
                                                 queue_worker_event(
                                                     &worker_events,
