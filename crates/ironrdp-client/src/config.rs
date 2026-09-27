@@ -767,6 +767,7 @@ pub struct ConfigBuilder {
     autologon: Option<bool>,
     enable_server_pointer: Option<bool>,
     pointer_software_rendering: Option<bool>,
+    support_dyn_vc_gfx_protocol: Option<bool>,
     performance_flags: Option<ironrdp_pdu::rdp::client_info::PerformanceFlags>,
     enable_audio_playback: Option<bool>,
     enable_audio_capture: Option<bool>,
@@ -1164,6 +1165,22 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_pointer_software_rendering(mut self, enabled: bool) -> Self {
         self.pointer_software_rendering = Some(enabled);
+        self
+    }
+
+    /// Advertise support for the Remote Desktop Protocol: Graphics Pipeline Extension (EGFX).
+    ///
+    /// When enabled, the connector sets `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL` in the Client Core
+    /// Data `earlyCapabilityFlags`. Some servers, GNOME Remote Desktop 50 among them, refuse to
+    /// serve a session at all unless the client advertises this flag.
+    ///
+    /// Enable this only when an EGFX-capable dynamic channel is registered for the session, which
+    /// is the case for the client provided by this crate.
+    ///
+    /// The default is `false`, so EGFX is not advertised.
+    #[must_use]
+    pub fn with_support_dyn_vc_gfx_protocol(mut self, enabled: bool) -> Self {
+        self.support_dyn_vc_gfx_protocol = Some(enabled);
         self
     }
 
@@ -1947,7 +1964,7 @@ impl ConfigBuilder {
             request_data: None,
             pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
             multitransport_flags: None,
-            support_dyn_vc_gfx_protocol: false,
+            support_dyn_vc_gfx_protocol: self.support_dyn_vc_gfx_protocol.unwrap_or(false),
             compression_type,
             performance_flags: self.performance_flags.unwrap_or_default(),
             timezone_info: TimezoneInfo::default(),
