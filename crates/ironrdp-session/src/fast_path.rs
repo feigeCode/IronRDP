@@ -114,6 +114,7 @@ impl FastPathBulkDecompressionFailure {
 #[derive(Debug)]
 pub enum UpdateKind {
     None,
+    Orders(Vec<u8>),
     Region(InclusiveRectangle),
     PointerDefault,
     PointerHidden,
@@ -208,7 +209,7 @@ impl Processor {
                 if raw_update_code.is_some_and(is_visual_update_code)
                     && matches!(error.kind(), DecodeErrorKind::NotEnoughBytes { .. }) =>
             {
-                let DecodeErrorKind::NotEnoughBytes { received, expected } = error.kind() else {
+                let DecodeErrorKind::NotEnoughBytes { received, expected, .. } = error.kind() else {
                     return Err(SessionError::decode(error));
                 };
                 let discarded_bytes = input.read_remaining().len();
@@ -248,6 +249,10 @@ impl Processor {
         let update = FastPathUpdate::decode_with_code(data.as_slice(), attributes.update_code);
 
         match update {
+            Ok(FastPathUpdate::Orders(orders)) => {
+                trace!("Received Fast-Path Orders update");
+                processor_updates.push(UpdateKind::Orders(orders.to_vec()));
+            }
             Ok(FastPathUpdate::SurfaceCommands(surface_commands)) => {
                 trace!("Received Surface Commands: {} pieces", surface_commands.len());
                 let update_region = self.process_surface_commands(image, output, surface_commands)?;
@@ -271,11 +276,11 @@ impl Processor {
                 // to ignore the unsupported update PDUs, but this is a fragile logic and the rationale behind it is not
                 // obvious.
                 match e.kind() {
-                    DecodeErrorKind::InvalidField { field, reason } => {
+                    DecodeErrorKind::InvalidField { field, reason, .. } => {
                         warn!(field, reason, "Ignoring invalid Fast-Path update");
                         processor_updates.push(UpdateKind::None);
                     }
-                    DecodeErrorKind::NotEnoughBytes { received, expected }
+                    DecodeErrorKind::NotEnoughBytes { received, expected, .. }
                         if is_visual_update_code(attributes.update_code.as_u8()) =>
                     {
                         warn!(

@@ -117,6 +117,22 @@ pub trait RdpsndServerHandler: Send + core::fmt::Debug {
     /// Called when the audio stream is torn down (e.g. the client closed the
     /// channel or the session ended).
     fn stop(&mut self);
+
+    /// Called for every Wave Confirm PDU the client sends.
+    ///
+    /// `timestamp` answers the `wTimeStamp` the server put on the wave with
+    /// this `block_no`. It is not an echo: [\[MS-RDPEA\] 2.2.3.8] sets it to
+    /// that value *plus* the milliseconds between receiving the complete wave
+    /// and sending the confirm, so the difference from the wave's own
+    /// timestamp is the time the client held the data, not a round trip.
+    ///
+    /// One block may be confirmed more than once, with different timestamps.
+    /// The default implementation ignores it.
+    ///
+    /// [\[MS-RDPEA\] 2.2.3.8]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/1c67d6d0-4e8b-4e1a-9d3a-cd0d6f0d1c5f
+    fn wave_confirm(&mut self, block_no: u8, timestamp: u16) {
+        let _ = (block_no, timestamp);
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -187,24 +203,47 @@ impl RdpsndServer {
             .format_no
             .ok_or_else(|| pdu_other_err!("invalid state - no format"))?;
 
+        // The client answers wTimeStamp in the Wave Confirm PDU, offset by how
+        // long it held the data, so sending zero leaves that measurement no
+        // reference to be relative to. Carry the low bits of the same capture
+        // time the 32-bit dwAudioTimeStamp gets, so both fields describe one
+        // instant.
+        let [timestamp_lo, timestamp_hi, _, _] = ts.to_le_bytes();
+        let wire_timestamp = u16::from_le_bytes([timestamp_lo, timestamp_hi]);
+
         // The server doesn't wait for wave confirm, apparently FreeRDP neither.
         let msg = if version >= pdu::Version::V8 {
             let pdu = pdu::Wave2Pdu {
                 block_no: self.block_no,
-                timestamp: 0,
+                timestamp: wire_timestamp,
                 audio_timestamp: ts,
                 format_no,
                 data: data.into(),
             };
             RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Wave2(pdu).into()])
         } else {
-            let pdu = pdu::WavePdu {
+            // Pre-v8: WaveInfo PDU (§2.2.3.3), then a bare Wave payload (§2.2.3.4).
+            if data.len() < usize::from(pdu::WavePdu::MIN_AUDIO_LENGTH) {
+                return Err(pdu_other_err!("wave data shorter than WaveInfo Data prefix"));
+            }
+            // BodySize = 8 + audio_length must fit in the 16-bit RDPSND header field.
+            if data.len() > usize::from(pdu::WavePdu::MAX_AUDIO_LENGTH) {
+                return Err(pdu_other_err!("wave data too large for WaveInfo BodySize"));
+            }
+            let audio_length = u16::try_from(data.len()).map_err(|_| pdu_other_err!("wave data too large"))?;
+            let mut data_prefix = [0u8; 4];
+            data_prefix.copy_from_slice(&data[..4]);
+            let info = pdu::WavePdu {
                 block_no: self.block_no,
                 format_no,
-                timestamp: 0,
-                data: data.into(),
+                timestamp: wire_timestamp,
+                data_prefix,
+                audio_length,
             };
-            RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Wave(pdu).into()])
+            let wave_data = pdu::WaveDataPdu {
+                data: data[4..].to_vec(),
+            };
+            RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Wave(info).into(), wave_data.into()])
         };
 
         self.block_no = self.block_no.overflowing_add(1).0;
@@ -246,7 +285,7 @@ fn negotiate_formats(
         .filter_map(|server_format| {
             client_formats
                 .iter()
-                .position(|client_fmt| audio_format_eq(client_fmt, server_format))
+                .position(|client_fmt| client_fmt.matches_for_negotiation(server_format))
                 .and_then(|idx| u16::try_from(idx).ok())
                 .map(|wformat_no| NegotiatedFormat {
                     format: server_format.clone(),
@@ -254,26 +293,6 @@ fn negotiate_formats(
                 })
         })
         .collect()
-}
-
-/// Compare two audio formats for negotiation. The WAVEFORMATEX identity fields
-/// — wave format tag, channel count, sample rate, bit depth — must match, and so
-/// must the codec-specific extra-data blob (`data`).
-///
-/// The two derived fields (`n_avg_bytes_per_sec`, `n_block_align`) are
-/// deliberately ignored: they are computable from the others and a client may
-/// legitimately not echo them back byte-for-byte. The `data` blob is a different
-/// category, though — for codecs whose extra-format bytes carry real
-/// configuration (AAC's HEAACWAVEINFO extra data is the clear case, MS-RDPEA
-/// 2.2.2.1.1's `cbSize` + extra data), ignoring it could match two genuinely
-/// incompatible formats, so it IS compared.
-#[cfg_attr(feature = "__test", visibility::make(pub))]
-fn audio_format_eq(a: &pdu::AudioFormat, b: &pdu::AudioFormat) -> bool {
-    a.format == b.format
-        && a.n_channels == b.n_channels
-        && a.n_samples_per_sec == b.n_samples_per_sec
-        && a.bits_per_sample == b.bits_per_sample
-        && a.data == b.data
 }
 
 impl_as_any!(RdpsndServer);
@@ -357,6 +376,7 @@ impl SvcProcessor for RdpsndServer {
             RdpsndState::Ready => {
                 if let pdu::ClientAudioOutputPdu::WaveConfirm(c) = pdu {
                     debug!(?c);
+                    self.handler.wave_confirm(c.block_no, c.timestamp);
                 }
                 vec![]
             }

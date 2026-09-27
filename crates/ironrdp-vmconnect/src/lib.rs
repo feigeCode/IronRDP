@@ -26,8 +26,39 @@ use ironrdp_pdu::nego::SecurityProtocol;
 use ironrdp_pdu::pcb::{PcbVersion, PreconnectionBlob};
 use tracing::{debug, instrument};
 
+#[cfg(windows)]
+mod framebuffer;
+#[cfg(windows)]
+pub use framebuffer::{FRAME_BUFFER_CHANNEL_NAME, FrameBufferClient};
+#[cfg(windows)]
+mod native_credssp;
+
+#[cfg(all(windows, feature = "__test"))]
+#[doc(hidden)]
+pub fn __test_binding_hash(magic: &[u8], nonce: &[u8; 32], public_key: &[u8]) -> Vec<u8> {
+    native_credssp::binding_hash(magic, nonce, public_key)
+}
+
 /// TCP port a Hyper-V VM console listens on.
 pub const PORT: u16 = 2179;
+
+/// Reads the local RDP server instance ID used to prove a same-machine FBR connection.
+#[cfg(windows)]
+pub fn local_instance_id() -> ConnectorResult<String> {
+    let key = windows_registry::LOCAL_MACHINE
+        .open(r"System\CurrentControlSet\Control\Terminal Server")
+        .map_err(|error| custom_err!("open Terminal Server registry key", error))?;
+    let instance_id = key
+        .get_string("InstanceID")
+        .map_err(|error| custom_err!("read Terminal Server InstanceID", error))?;
+    if instance_id.encode_utf16().count() != 31 {
+        return Err(reason_err!(
+            "vmconnect",
+            "terminal server InstanceID has an invalid length"
+        ));
+    }
+    Ok(instance_id)
+}
 
 /// Upper bound for transmitting the Preconnection Blob after the TCP connection is established.
 ///
@@ -55,16 +86,30 @@ pub enum Mode {
 
 /// Receipt that the Preconnection Blob was written. Required by [`connect_front`].
 #[derive(Debug)]
-#[must_use = "pass this to connect_front after TLS"]
+#[must_use = "pass this to a connect_front function after TLS"]
 #[non_exhaustive]
 pub struct PcbSent;
 
 /// Encode a PCB V2 for the selected console mode.
 pub fn encode_preconnection_blob(vm_id: &str, mode: Mode) -> ConnectorResult<Vec<u8>> {
-    let payload = match mode {
+    let payload = preconnection_blob_payload(vm_id, mode)?;
+    encode_preconnection_blob_payload(payload)
+}
+
+/// Build the Unicode PCB V2 payload used to select a VM and console mode.
+pub fn preconnection_blob_payload(vm_id: &str, mode: Mode) -> ConnectorResult<String> {
+    if vm_id.trim().is_empty() {
+        return Err(reason_err!("vmconnect", "vmconnect VM ID is empty"));
+    }
+
+    Ok(match mode {
         Mode::Enhanced => format!("{vm_id}{ENHANCED_MODE_SUFFIX}"),
         Mode::Basic => vm_id.to_owned(),
-    };
+    })
+}
+
+/// Encode a PCB V2 containing an opaque routing payload.
+pub fn encode_preconnection_blob_payload(payload: String) -> ConnectorResult<Vec<u8>> {
     encode_vec(&PreconnectionBlob {
         id: 0,
         version: PcbVersion::V2,
@@ -92,6 +137,11 @@ where
     Ok(PcbSent)
 }
 
+/// Receipt after an RDCleanPath proxy has written the PCB and established TLS.
+pub fn pcb_sent_via_proxy() -> PcbSent {
+    PcbSent
+}
+
 /// After TLS: CredSSP, then X.224. Consumes [`PcbSent`]; returns [`Upgraded`] for
 /// [`ironrdp_async::connect_finalize`].
 ///
@@ -109,7 +159,7 @@ pub async fn connect_front<S, N>(
     kerberos_config: Option<KerberosConfig>,
 ) -> ConnectorResult<Upgraded>
 where
-    S: Sync + FramedRead + FramedWrite,
+    S: FramedRead + FramedWrite,
     N: NetworkClient,
 {
     prepare_connector(connector)?;
@@ -127,6 +177,43 @@ where
     )?;
     perform_credssp(framed, network_client, &mut buf, sequence, ts_request).await?;
 
+    finish_front(framed, connector, &mut buf).await
+}
+
+/// After TLS, authenticate the Hyper-V host with the caller's current Windows logon token, then
+/// negotiate X.224.
+///
+/// This matches native VMConnect's implicit-credential path and never exposes or stores the
+/// current user's password.
+#[cfg(windows)]
+#[instrument(skip_all)]
+pub async fn connect_front_with_current_user<S>(
+    _pcb_sent: PcbSent,
+    framed: &mut Framed<S>,
+    connector: &mut ClientConnector,
+    server_name: ServerName,
+    server_public_key: &[u8],
+) -> ConnectorResult<Upgraded>
+where
+    S: FramedRead + FramedWrite,
+{
+    prepare_connector(connector)?;
+
+    debug!("Begin native CredSSP with current Windows credentials");
+    native_credssp::perform(framed, server_name, server_public_key).await?;
+
+    let mut buf = WriteBuf::new();
+    finish_front(framed, connector, &mut buf).await
+}
+
+async fn finish_front<S>(
+    framed: &mut Framed<S>,
+    connector: &mut ClientConnector,
+    buf: &mut WriteBuf,
+) -> ConnectorResult<Upgraded>
+where
+    S: FramedRead + FramedWrite,
+{
     // Host authentication is complete. Do not forward its identity or secret into the guest-facing
     // RDP sequence; Enhanced Session guest sign-in is a separate authentication seam. This happens
     // only after successful CredSSP, so a failed authentication leaves the connector reusable.
@@ -138,7 +225,7 @@ where
     connector.config.autologon = false;
 
     buf.clear();
-    connector.initiate_with_security_protocol(POST_CREDSSP_PROTOCOL, &mut buf)?;
+    connector.initiate_with_security_protocol(POST_CREDSSP_PROTOCOL, buf)?;
     framed
         .write_all(buf.filled())
         .await
@@ -156,25 +243,22 @@ where
 ///
 /// CredSSP runs before X.224 and TLS is already up when this path is used. Clearing
 /// `enable_tls` / `enable_credssp` would make the later Negotiate Request advertise a protocol
-/// set that disagrees with the bytes already exchanged. Every embedder (client, FFI, web) goes
-/// through [`connect_front`], so this is the single choke point.
-fn prepare_connector(connector: &mut ClientConnector) -> ConnectorResult<()> {
+/// set that disagrees with the bytes already exchanged.
+///
+/// Call this before any pre-X.224 CredSSP path that does not go through [`connect_front`]
+/// (for example FFI `CredsspSequence::init_with_protocol`).
+pub fn prepare_connector(connector: &ClientConnector) -> ConnectorResult<()> {
     if !connector.config.enable_tls {
-        return Err(reason_err!(
-            "vmconnect",
-            "TLS is required for a Hyper-V console connection",
-        ));
+        return Err(reason_err!("vmconnect", "vmconnect requires TLS"));
     }
     if !connector.config.enable_credssp {
-        return Err(reason_err!(
-            "vmconnect",
-            "CredSSP is required for a Hyper-V console connection",
-        ));
+        return Err(reason_err!("vmconnect", "vmconnect requires CredSSP"));
     }
     Ok(())
 }
 
-fn ensure_selected_credssp(state: &ClientConnectorState) -> ConnectorResult<()> {
+/// Require the post-CredSSP X.224 response to select HYBRID.
+pub fn ensure_selected_credssp(state: &ClientConnectorState) -> ConnectorResult<()> {
     let selected = match state {
         ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol } => *selected_protocol,
         other => {

@@ -66,3 +66,28 @@ fn check_egfx_avc420_decode() {
 fn check_egfx_multi_frame() {
     check!(egfx_multi_frame);
 }
+
+#[test]
+fn check_rdpeusb_decode() {
+    check!(rdpeusb_decode);
+}
+
+#[test]
+fn check_message_decoding_invariants() {
+    check!(message_decoding_invariants);
+}
+
+#[test]
+fn check_egfx_avc444_decode() {
+    check!(egfx_avc444_decode);
+}
+
+#[test]
+fn check_egfx_zgfx_decompress() {
+    check!(egfx_zgfx_decompress);
+}
+
+#[test]
+fn check_egfx_surface_state() {
+    check!(egfx_surface_state);
+}

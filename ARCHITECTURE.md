@@ -102,6 +102,29 @@ RDPDR channel implementation.
 
 RDPSND static channel for audio output implemented as described in MS-RDPEA.
 
+#### [`crates/ironrdp-egfx`](./crates/ironrdp-egfx)
+
+EGFX dynamic channel implemented as described in MS-RDPEGFX.
+
+#### [`crates/ironrdp-rdpeai`](./crates/ironrdp-rdpeai)
+
+AUDIO_INPUT dynamic channel for client microphone capture implemented as described in MS-RDPEAI.
+
+#### [`crates/ironrdp-rdpecam`](./crates/ironrdp-rdpecam)
+
+Video capture dynamic channel client and backend boundary implemented as described in MS-RDPECAM.
+The crate performs no camera I/O and advertises only devices explicitly supplied by its caller.
+
+#### [`crates/ironrdp-rdpel`](./crates/ironrdp-rdpel)
+
+Location dynamic channel client and PDU codecs implemented as described in MS-RDPEL.
+The crate forwards only location data supplied by its caller and performs no location acquisition or I/O.
+
+#### [`crates/ironrdp-rdpewa`](./crates/ironrdp-rdpewa)
+
+RDPEWA dynamic virtual channel for WebAuthn redirection as described in MS-RDPEWA.
+The Windows backend lives in [`crates/ironrdp-rdpewa-native`](./crates/ironrdp-rdpewa-native).
+
 #### [`crates/ironrdp-connector`](./crates/ironrdp-connector)
 
 State machines to drive an RDP connection sequence.
@@ -282,6 +305,10 @@ Contains all integration tests for code living in the extra tier, in a single bi
 #### [`crates/ironrdp-fuzzing`](./crates/ironrdp-fuzzing)
 
 Provides test case generators and oracles for use with fuzzing.
+
+#### [`crates/ironrdp-capture-replay`](./crates/ironrdp-capture-replay)
+
+Offline direct-TCP RDP capture analysis that routes recovered plaintext and exports payload-free replay diagnostics with rendered framebuffer snapshots.
 
 #### [`fuzz`](./fuzz)
 

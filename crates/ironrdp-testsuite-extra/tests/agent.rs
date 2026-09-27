@@ -13,7 +13,8 @@ use ironrdp_propertyset::PropertySet;
 use ironrdp_rpc::ipc::{
     AgentError, AgentErrorCategory, ConnState, KeyFilter, NowCapabilities, NowDiagnostics, NowExecutionKind,
     NowExecutionRequest, NowStream, OperationEvent, OperationEventKind, OperationInfo, OperationState, Payload,
-    PropValue, PropertyDump, PropertyEntry, Request, Response, StatusInfo,
+    PropValue, PropertyDump, PropertyEntry, RailEvent, RailEventDump, RailEventKind, RailExecuteFailureReason,
+    RailExecuteRequest, RailLaunchInfo, RailStatusInfo, Request, Response, StatusInfo,
 };
 use ironrdp_rpc::wire;
 
@@ -84,6 +85,39 @@ fn request_variants_round_trip() {
             ch: '\u{00e9}',
             pressed: true,
         },
+        Request::UnicodeText {
+            text: "Hello, \u{4e16}\u{754c}".to_owned(),
+        },
+        Request::Touch {
+            encode_time: 12,
+            frames: vec![ironrdp_rpc::ipc::TouchFrameRequest {
+                frame_offset: 0,
+                contacts: vec![ironrdp_rpc::ipc::TouchContactRequest {
+                    contact_id: 1,
+                    x: 100,
+                    y: 200,
+                    flags: 0x0019, // DOWN | INRANGE | INCONTACT
+                }],
+            }],
+        },
+        Request::Pen {
+            encode_time: 24,
+            frames: vec![ironrdp_rpc::ipc::PenFrameRequest {
+                frame_offset: 0,
+                contacts: vec![ironrdp_rpc::ipc::PenContactRequest {
+                    device_id: 0,
+                    x: 300,
+                    y: 400,
+                    flags: 0x0019, // DOWN | INRANGE | INCONTACT
+                    pressure: Some(512),
+                    rotation: Some(45),
+                    tilt_x: Some(10),
+                    tilt_y: Some(-5),
+                    pen_flags: None,
+                }],
+            }],
+        },
+        Request::DismissHoveringTouchContact { contact_id: 3 },
         Request::NowCapabilities,
         Request::NowRun {
             command: "echo secret".to_owned(),
@@ -113,6 +147,32 @@ fn request_variants_round_trip() {
             last: true,
         },
         Request::NowDiagnostics,
+        Request::RailStatus,
+        Request::RailEvents {
+            after_sequence: Some(7),
+        },
+        Request::RailWait {
+            after_sequence: Some(7),
+            timeout_ms: 1_000,
+        },
+        Request::RailExecute(RailExecuteRequest {
+            executable: "notepad.exe".to_owned(),
+            working_directory: "C:\\Temp".to_owned(),
+            arguments: "audit.txt".to_owned(),
+            flags: 0,
+        }),
+        Request::ClipboardGet,
+        Request::ClipboardSet {
+            text: "clipboard text".to_owned(),
+        },
+        Request::ClipboardGetImage,
+        Request::ClipboardSetImage {
+            png: vec![0x89, b'P', b'N', b'G', 0, 0xFF],
+        },
+        Request::ClipboardGetHtml,
+        Request::ClipboardSetHtml {
+            html: "<b>clipboard html</b>".to_owned(),
+        },
     ];
 
     for request in &requests {
@@ -213,6 +273,56 @@ fn response_variants_round_trip() {
             connected: false,
             capabilities: None,
         })),
+        Response::Ok(Payload::RailStatus(RailStatusInfo {
+            generation: 9,
+            next_sequence: 4,
+            handshake_complete: true,
+            desktop_synchronized: false,
+            pending_launches: vec![RailLaunchInfo {
+                launch_id: 3,
+                executable: "notepad.exe".to_owned(),
+                flags: 0,
+            }],
+        })),
+        Response::Ok(Payload::RailEvents(RailEventDump {
+            generation: 9,
+            events: vec![
+                RailEvent {
+                    sequence: 1,
+                    kind: RailEventKind::Gap { lost_through: 4 },
+                },
+                RailEvent {
+                    sequence: 5,
+                    kind: RailEventKind::ExecuteResult {
+                        launch_id: Some(3),
+                        executable: "notepad.exe".to_owned(),
+                        flags: 0,
+                        result: 0,
+                        raw_result: 0,
+                    },
+                },
+                RailEvent {
+                    sequence: 6,
+                    kind: RailEventKind::ExecuteFailed {
+                        launch_id: Some(3),
+                        executable: "notepad.exe".to_owned(),
+                        flags: 0,
+                        reason: RailExecuteFailureReason::QueueRejected,
+                    },
+                },
+            ],
+        })),
+        Response::Ok(Payload::RailLaunch(RailLaunchInfo {
+            launch_id: 3,
+            executable: "notepad.exe".to_owned(),
+            flags: 0,
+        })),
+        Response::Ok(Payload::ClipboardText(None)),
+        Response::Ok(Payload::ClipboardText(Some("clipboard text".to_owned()))),
+        Response::Ok(Payload::ClipboardImage(None)),
+        Response::Ok(Payload::ClipboardImage(Some(vec![0x89, b'P', b'N', b'G', 0, 0xFF]))),
+        Response::Ok(Payload::ClipboardHtml(None)),
+        Response::Ok(Payload::ClipboardHtml(Some("<b>clipboard html</b>".to_owned()))),
     ];
 
     for response in &responses {
@@ -258,6 +368,54 @@ fn bytes_wire_round_trips() {
     let mut read_cursor = ironrdp_core::ReadCursor::new(&buf);
     let decoded = wire::read_bytes(&mut read_cursor).expect("read_bytes");
     assert_eq!(original, decoded, "bytes wire round-trip mismatch");
+}
+
+#[test]
+fn opt_bytes_wire_round_trips() {
+    for original in [None, Some(vec![0x89, b'P', b'N', b'G', 0x00, 0xFF])] {
+        let size = wire::opt_bytes_size(original.as_deref());
+        let mut buf = vec![0u8; size];
+        let mut cursor = ironrdp_core::WriteCursor::new(&mut buf);
+        wire::write_opt_bytes(&mut cursor, original.as_deref()).expect("write_opt_bytes");
+        assert_eq!(cursor.pos(), size, "written length must match computed size");
+
+        let mut read_cursor = ironrdp_core::ReadCursor::new(&buf);
+        let decoded = wire::read_opt_bytes(&mut read_cursor).expect("read_opt_bytes");
+        assert_eq!(original, decoded, "optional bytes wire round-trip mismatch");
+    }
+}
+
+#[test]
+fn clipboard_debug_redacts_content() {
+    let request = Request::ClipboardSet {
+        text: "secret-text".to_owned(),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret-text"));
+
+    let payload = Payload::ClipboardText(Some("secret-text".to_owned()));
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("secret-text"));
+
+    let request = Request::ClipboardSetImage {
+        png: b"secret-pixels".to_vec(),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret-pixels"));
+
+    let payload = Payload::ClipboardImage(Some(b"secret-pixels".to_vec()));
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("secret-pixels"));
+
+    let request = Request::ClipboardSetHtml {
+        html: "<b>secret-markup</b>".to_owned(),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret-markup"));
+
+    let payload = Payload::ClipboardHtml(Some("<b>secret-markup</b>".to_owned()));
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("secret-markup"));
 }
 
 #[test]

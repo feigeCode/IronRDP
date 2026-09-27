@@ -220,16 +220,29 @@ pub trait UrbdrcDeviceServerBackend: Send {
         request_id: RequestId,
         completion: TransferOutCompletionResult,
     ) -> PduResult<()>;
+
+    /// Notifies the backend that the per-device dynamic channel has closed.
+    fn close(&mut self, _channel_id: u32) {}
 }
 
 pub struct UrbdrcDeviceServer {
     msg_alloc: IdAllocator,
     request_id_alloc: RequestIdAllocator,
+    state: DeviceState,
     udev_iface: Option<InterfaceId>,
     comp_iface: InterfaceId,
     no_ack_isoch_write_jitter_buf_size: Option<NoAckIsochWriteJitterBufSizeInMs>,
     pending_io: BTreeMap<RequestId, Pending>,
     backend: Box<dyn UrbdrcDeviceServerBackend>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeviceState {
+    AwaitingCaps,
+    AwaitingChanCreated,
+    AwaitingDevice,
+    Ready,
+    Retracted,
 }
 
 enum Pending {
@@ -292,6 +305,7 @@ impl UrbdrcDeviceServer {
         Ok(Self {
             msg_alloc: IdAllocator::new(),
             request_id_alloc: RequestIdAllocator::new(),
+            state: DeviceState::AwaitingCaps,
             udev_iface: None,
             comp_iface,
             no_ack_isoch_write_jitter_buf_size: None,
@@ -443,6 +457,14 @@ impl UrbdrcDeviceServer {
         })
     }
 
+    /// Cancel Request Message ([MS-RDPEUSB] section 2.2.6.1):
+    ///
+    /// Asks the client to stop processing `request_id`. This does not release
+    /// the request: a transmitted request is always answered by a completion,
+    /// and a cancelled one completes with a failure `HRESULT` ([MS-RDPEUSB]
+    /// sections 3.3.5.3.1 and 3.3.5.3.6). That completion is what releases the
+    /// tracking state, so releasing it here would make the completion look
+    /// unsolicited.
     pub fn cancel_request(&mut self, request_id: RequestId) -> PduResult<DvcMessage> {
         let udev_iface = self.usb_device_iface()?;
         Ok(Box::new(CancelRequest {
@@ -452,18 +474,42 @@ impl UrbdrcDeviceServer {
         }))
     }
 
+    /// Releases a request that was built but never handed to the DVC transport.
+    ///
+    /// Every transmitted request is eventually answered by a completion, and
+    /// handling that completion is what releases the request's tracking state.
+    /// A request that never reached the transport is never answered, so without
+    /// this its state would be held until the channel closes.
+    ///
+    /// `request` MUST NOT have been transmitted. Passing it by value keeps the
+    /// normal path honest, since writing a request moves
+    /// [`ServerIoRequest::message`] out of it. That is a convention rather than
+    /// enforcement: encoding the message through a shared borrow leaves the
+    /// request intact, and abandoning it afterwards makes the completion that
+    /// does arrive look unsolicited.
+    ///
+    /// Use [`Self::cancel_request`] instead to stop a request already in flight.
+    pub fn abandon_unsent(&mut self, request: ServerIoRequest) {
+        // Vacant for a no-ack request, which is tracked nowhere to begin with.
+        self.pending_io.remove(&request.request_id);
+    }
+
     pub fn retract_device(&mut self, reason: UsbRetractReason) -> PduResult<DvcMessage> {
         let udev_iface = self.usb_device_iface()?;
-        self.pending_io.clear();
-        self.no_ack_isoch_write_jitter_buf_size = None;
-        Ok(Box::new(RetractDevice {
+        let message = Box::new(RetractDevice {
             msg_id: self.msg_alloc.alloc(),
             udev_iface,
             reason,
-        }))
+        });
+        self.state = DeviceState::Retracted;
+        Ok(message)
     }
 
     fn usb_device_iface(&self) -> PduResult<InterfaceId> {
+        if self.state != DeviceState::Ready {
+            return Err(pdu_other_err!("USB device is not ready for I/O"));
+        }
+
         self.udev_iface
             .ok_or_else(|| pdu_other_err!("USB device uninitialized"))
     }
@@ -639,43 +685,67 @@ impl DvcProcessor for UrbdrcDeviceServer {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        Ok(vec![Box::new(ChannelCreated {
+        Ok(vec![Box::new(RimExchangeCapabilityRequest {
             msg_id: self.msg_alloc.alloc(),
-            direction: crate::pdu::notify::Direction::ToClient,
+            capability: crate::pdu::caps::Capability::RimCapabilityVersion01,
         })])
     }
 
     fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        // SPEC [3.1.5]: Messages received after RETRACT_DEVICE are out of sequence and
+        // MUST be ignored while the containing DVC is being closed.
+        //
+        // [3.1.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeusb/f31cc9ef-a8c3-4a4d-b64d-f027ed0752b0
+        if self.state == DeviceState::Retracted {
+            return Ok(Vec::new());
+        }
+
         let pdu = UrbdrcClientDevicePdu::decode(&mut ReadCursor::new(payload)).map_err(|e| decode_err!(e))?;
         let mut resp: Vec<DvcMessage> = Vec::new();
 
         use UrbdrcClientDevicePdu::*;
         match pdu {
+            Caps(_caps_response_pdu) => {
+                if self.state != DeviceState::AwaitingCaps {
+                    return Err(pdu_other_err!("invalid state"));
+                }
+                resp.push(Box::new(InterfaceRelease {
+                    iface_id: InterfaceId::CAPABILITIES.with_mask(Mask::None),
+                    msg_id: self.msg_alloc.alloc(),
+                }));
+                resp.push(Box::new(ChannelCreated {
+                    msg_id: self.msg_alloc.alloc(),
+                    direction: crate::pdu::notify::Direction::ToClient,
+                }));
+                self.state = DeviceState::AwaitingChanCreated;
+                Ok(resp)
+            }
             ChanCreated(_channel_created_pdu) => {
+                if self.state != DeviceState::AwaitingChanCreated {
+                    return Err(pdu_other_err!("invalid state"));
+                }
                 resp.push(Box::new(InterfaceRelease {
                     msg_id: self.msg_alloc.alloc(),
                     iface_id: InterfaceId::NOTIFY_CLIENT.with_mask(Mask::Proxy),
                 }));
+                self.state = DeviceState::AwaitingDevice;
                 Ok(resp)
             }
             AddDev(add_dev_pdu) => {
                 // In the case of the server receiving a duplicate interface ID, the server MUST
                 // ignore the ADD_DEVICE message.
-                if self.udev_iface.is_some() {
+                if self.state != DeviceState::AwaitingDevice {
                     return Ok(resp);
                 }
                 let udev_iface = add_dev_pdu.usb_device;
                 let no_ack_isoch_write_jitter_buf_size = add_dev_pdu.usb_device_caps.no_ack_isoch_write_jitter_buf_size;
-                self.udev_iface = Some(udev_iface);
 
                 let device = add_dev_pdu.try_into()?;
 
                 self.backend.add_device(device)?;
+                self.udev_iface = Some(udev_iface);
                 self.no_ack_isoch_write_jitter_buf_size = Some(no_ack_isoch_write_jitter_buf_size);
-                resp.push(Box::new(InterfaceRelease {
-                    msg_id: self.msg_alloc.alloc(),
-                    iface_id: InterfaceId::DEVICE_SINK.with_mask(Mask::Proxy),
-                }));
+                self.state = DeviceState::Ready;
                 resp.push(Box::new(RegisterRequestCallback {
                     msg_id: self.msg_alloc.alloc(),
                     udev_iface,
@@ -706,6 +776,10 @@ impl DvcProcessor for UrbdrcDeviceServer {
                 Ok(resp)
             }
         }
+    }
+
+    fn close(&mut self, channel_id: u32) {
+        self.backend.close(channel_id);
     }
 }
 

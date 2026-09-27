@@ -6,4 +6,10 @@
 
 pub mod cli;
 
+pub(crate) mod gw_forward;
 pub(crate) mod help;
+
+#[cfg(windows)]
+pub(crate) mod sandbox;
+#[cfg(windows)]
+pub(crate) mod sandbox_grpc;
