@@ -28,7 +28,7 @@ use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::gcc::{ChannelName, Monitor};
-use ironrdp_pdu::geometry::InclusiveRectangle;
+use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::input::MousePdu;
 use ironrdp_pdu::input::fast_path::FastPathInputEvent;
 use ironrdp_pdu::input::mouse::PointerFlags;
@@ -3017,6 +3017,77 @@ fn process_rdpdr_drive_change(
     }
 }
 
+/// Upper bound on how many packed regions a single desktop update batch may carry.
+///
+/// Past this point the batch is collapsed into the bounding box of everything it
+/// covers, which is coarser but still pixel-exact because every region is copied out
+/// of the same already composited image.
+const MAX_DAMAGE_REGIONS_PER_BATCH: usize = 64;
+
+/// Merges overlapping damage regions so one batch never packs the same pixels twice.
+///
+/// Incremental batches routinely report stacked bands: a partial repaint of a window,
+/// a full-width scroll band on top of it, a tooltip covering part of both. Packing each
+/// of them separately ships the overlap once per band, which is what turns a single
+/// modest screen change into tens of megabytes of downstream work. Every region is
+/// copied out of the same, already composited image, so any superset of the damaged
+/// area carries correct pixels: replacing two regions by their bounding box changes
+/// nothing the embedder sees, it only decides how many redundant pixels travel with it.
+///
+/// Only merges that are free are accepted, i.e. where the bounding box is *exactly* the
+/// area the two regions cover together: a contained region, bands that share a full
+/// edge, or a repaint that covers its predecessor. Accepting an approximative merge
+/// instead would let repeated rounds of merging grow a couple of changed pixels into a
+/// full-screen payload, which is far more expensive downstream than the overlap saved.
+fn coalesce_damage_regions(regions: &[InclusiveRectangle]) -> Vec<InclusiveRectangle> {
+    let mut merged: Vec<InclusiveRectangle> = Vec::with_capacity(regions.len());
+
+    for region in regions {
+        if region.left > region.right || region.top > region.bottom {
+            // Degenerate region: nothing to pack.
+            continue;
+        }
+
+        let mut current = region.clone();
+        let mut index = 0;
+        while index < merged.len() {
+            if let Some(union) = merge_damage_regions(&merged[index], &current) {
+                current = union;
+                merged.swap_remove(index);
+                // The widened region may overlap earlier entries again.
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+
+        merged.push(current);
+    }
+
+    if merged.len() > MAX_DAMAGE_REGIONS_PER_BATCH {
+        return vec![InclusiveRectangle::union_all(&merged)];
+    }
+
+    merged
+}
+
+/// Returns the bounding box to pack `a` and `b` as one region, or `None` when keeping
+/// them apart is the cheaper answer.
+fn merge_damage_regions(a: &InclusiveRectangle, b: &InclusiveRectangle) -> Option<InclusiveRectangle> {
+    let bbox = a.union(b);
+    let bbox_area = region_area(&bbox);
+    let covered_area = region_area(a) + region_area(b) - a.intersect(b).map_or(0, |overlap| region_area(&overlap));
+
+    // The bounding box is exactly what the two regions cover together, so the merge
+    // costs nothing: shared edges and contained regions land here, and so does a
+    // repaint that covers every pixel the earlier region had damaged.
+    (bbox_area == covered_area).then_some(bbox)
+}
+
+fn region_area(region: &InclusiveRectangle) -> u64 {
+    u64::from(region.width()) * u64::from(region.height())
+}
+
 fn pack_desktop_update(
     image: &DecodedImage,
     width: NonZeroU16,
@@ -3863,7 +3934,9 @@ async fn active_session(
                             if desktop_damage_regions.is_empty() {
                                 desktop_damage_regions.push(region);
                             }
-                            for region in desktop_damage_regions.drain(..) {
+                            let coalesced = coalesce_damage_regions(&desktop_damage_regions);
+                            desktop_damage_regions.clear();
+                            for region in coalesced {
                                 let update = pack_desktop_update(&image, width, height, region)?;
                                 if !send_active_output_event(
                                     output_event_sender,
@@ -5526,5 +5599,93 @@ mod tests {
     fn rdpsnd_backend_kind_playback_only_without_rdpdr() {
         assert_eq!(rdpsnd_backend_kind(true, false), Some(RdpsndBackendKind::Playback));
         assert_eq!(rdpsnd_backend_kind(false, false), None);
+    }
+
+    fn rect(left: u16, top: u16, right: u16, bottom: u16) -> InclusiveRectangle {
+        InclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn contained_damage_region_merges_into_the_region_that_covers_it() {
+        let regions = vec![rect(0, 0, 999, 999), rect(10, 10, 20, 20)];
+
+        assert_eq!(coalesce_damage_regions(&regions), vec![rect(0, 0, 999, 999)]);
+    }
+
+    #[test]
+    fn damage_bands_sharing_a_full_edge_merge_into_one_band() {
+        let regions = vec![rect(0, 0, 271, 191), rect(0, 192, 271, 383)];
+
+        assert_eq!(coalesce_damage_regions(&regions), vec![rect(0, 0, 271, 383)]);
+    }
+
+    #[test]
+    fn overlapping_repaint_bands_collapse_instead_of_shipping_the_overlap_twice() {
+        // Shape of the batches a Windows server produces at 2724x1530: full-width bands
+        // that step down the screen and overlap each other heavily.
+        let regions: Vec<_> = (0..12)
+            .map(|index| {
+                let top = u16::try_from(index).unwrap() * 128;
+                rect(0, top, 2723, top + 255)
+            })
+            .collect();
+
+        let coalesced = coalesce_damage_regions(&regions);
+
+        assert_eq!(coalesced, vec![rect(0, 0, 2723, 1663)]);
+        let packed: u64 = coalesced.iter().map(region_area).sum();
+        let naive: u64 = regions.iter().map(region_area).sum();
+        assert!(packed * 3 <= naive * 2, "packed {packed} pixels vs {naive} shipped before");
+    }
+
+    #[test]
+    fn a_contained_band_does_not_grow_the_batch_it_joins() {
+        let regions = vec![rect(0, 0, 2723, 1343), rect(0, 1280, 2723, 1529), rect(0, 1344, 2723, 1529)];
+
+        assert_eq!(coalesce_damage_regions(&regions), vec![rect(0, 0, 2723, 1529)]);
+    }
+
+    #[test]
+    fn disjoint_damage_regions_are_packed_separately() {
+        // Merging these would ship a screen-sized region to convey two small corners.
+        let regions = vec![rect(0, 0, 31, 31), rect(2000, 1400, 2031, 1431)];
+
+        assert_eq!(coalesce_damage_regions(&regions), regions);
+    }
+
+    #[test]
+    fn partially_overlapping_regions_stay_apart_when_their_box_is_mostly_empty() {
+        let regions = vec![rect(0, 0, 63, 63), rect(96, 96, 159, 159)];
+
+        assert_eq!(coalesce_damage_regions(&regions), regions);
+    }
+
+    #[test]
+    fn a_batch_beyond_the_region_budget_collapses_into_one_bounding_box() {
+        // Gapped bands along the vertical axis: too far apart to merge for free, so the
+        // batch really does exceed the budget and falls back to one bounding box.
+        let regions: Vec<_> = (0..MAX_DAMAGE_REGIONS_PER_BATCH + 1)
+            .map(|index| {
+                let top = u16::try_from(index).unwrap() * 8;
+                rect(0, top, 15, top + 3)
+            })
+            .collect();
+
+        let coalesced = coalesce_damage_regions(&regions);
+
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0], rect(0, 0, 15, (MAX_DAMAGE_REGIONS_PER_BATCH as u16) * 8 + 3));
+    }
+
+    #[test]
+    fn degenerate_damage_regions_are_dropped() {
+        let regions = vec![rect(10, 10, 9, 20), rect(0, 0, 3, 3)];
+
+        assert_eq!(coalesce_damage_regions(&regions), vec![rect(0, 0, 3, 3)]);
     }
 }
