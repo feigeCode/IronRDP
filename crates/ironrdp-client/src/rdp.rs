@@ -701,6 +701,7 @@ pub struct RdpClient {
     graceful_close_receiver: watch::Receiver<bool>,
     auto_reconnect_maximum_attempts: Option<u32>,
     desktop_update_enabled: bool,
+    graphics_pipeline_fallback: bool,
     #[cfg(feature = "clipboard")]
     cliprdr_backend_factory: Option<Box<dyn CliprdrBackendFactory + Send>>,
     #[cfg(feature = "rdpdr")]
@@ -726,6 +727,7 @@ impl RdpClient {
             graceful_close_receiver,
             auto_reconnect_maximum_attempts: None,
             desktop_update_enabled: false,
+            graphics_pipeline_fallback: false,
             #[cfg(feature = "clipboard")]
             cliprdr_backend_factory: None,
             #[cfg(feature = "rdpdr")]
@@ -778,6 +780,25 @@ impl RdpClient {
     #[must_use]
     pub fn with_desktop_updates(mut self) -> Self {
         self.desktop_update_enabled = true;
+        self
+    }
+
+    /// Enables a single retry with the RDP Graphics Pipeline capability advertised when a
+    /// connection attempt is refused without it.
+    ///
+    /// Some hosts (GNOME Remote Desktop 50) refuse to serve a session at all unless the client
+    /// advertises the capability in its Client Core Data, while others (Windows) accept such a
+    /// client and may then encode the session with codecs this client does not decode. An
+    /// embedder that cannot know the host ahead of time connects without the capability
+    /// (`ConfigBuilder::with_support_dyn_vc_gfx_protocol`) and enables this fallback so the
+    /// connection is retried once with it advertised if the server refuses the first attempt.
+    ///
+    /// A refused attempt never reaches activation, so it publishes no `Connected` event and no
+    /// frame: its failure is withheld from the output channel and is only reported when the
+    /// retry fails as well.
+    #[must_use]
+    pub fn with_graphics_pipeline_fallback(mut self) -> Self {
+        self.graphics_pipeline_fallback = true;
         self
     }
 
@@ -908,20 +929,18 @@ impl RdpClient {
                 {
                     Some(Ok(result)) => result,
                     Some(Err(error)) => {
-                        if self
-                            .try_auto_reconnect(
+                        if !self
+                            .handle_connect_failure(
+                                error,
                                 auto_reconnect_policy,
                                 &mut reconnect_attempt,
                                 auto_reconnect_cookie.as_ref(),
                             )
                             .await
                         {
-                            continue;
+                            break;
                         }
-                        if !self.send_output_event(RdpOutputEvent::ConnectionFailure(error)).await {
-                            self.emit_user_initiated_termination();
-                        }
-                        break;
+                        continue;
                     }
                     None => {
                         self.emit_user_initiated_termination();
@@ -974,20 +993,18 @@ impl RdpClient {
                     match connect_result {
                         Some(Ok(result)) => result,
                         Some(Err(error)) => {
-                            if self
-                                .try_auto_reconnect(
+                            if !self
+                                .handle_connect_failure(
+                                    error,
                                     auto_reconnect_policy,
                                     &mut reconnect_attempt,
                                     auto_reconnect_cookie.as_ref(),
                                 )
                                 .await
                             {
-                                continue;
+                                break;
                             }
-                            if !self.send_output_event(RdpOutputEvent::ConnectionFailure(error)).await {
-                                self.emit_user_initiated_termination();
-                            }
-                            break;
+                            continue;
                         }
                         None => {
                             self.emit_user_initiated_termination();
@@ -1012,20 +1029,18 @@ impl RdpClient {
                 {
                     Some(Ok(result)) => result,
                     Some(Err(error)) => {
-                        if self
-                            .try_auto_reconnect(
+                        if !self
+                            .handle_connect_failure(
+                                error,
                                 auto_reconnect_policy,
                                 &mut reconnect_attempt,
                                 auto_reconnect_cookie.as_ref(),
                             )
                             .await
                         {
-                            continue;
+                            break;
                         }
-                        if !self.send_output_event(RdpOutputEvent::ConnectionFailure(error)).await {
-                            self.emit_user_initiated_termination();
-                        }
-                        break;
+                        continue;
                     }
                     None => {
                         self.emit_user_initiated_termination();
@@ -1050,20 +1065,18 @@ impl RdpClient {
                 {
                     Some(Ok(result)) => result,
                     Some(Err(error)) => {
-                        if self
-                            .try_auto_reconnect(
+                        if !self
+                            .handle_connect_failure(
+                                error,
                                 auto_reconnect_policy,
                                 &mut reconnect_attempt,
                                 auto_reconnect_cookie.as_ref(),
                             )
                             .await
                         {
-                            continue;
+                            break;
                         }
-                        if !self.send_output_event(RdpOutputEvent::ConnectionFailure(error)).await {
-                            self.emit_user_initiated_termination();
-                        }
-                        break;
+                        continue;
                     }
                     None => {
                         self.emit_user_initiated_termination();
@@ -1170,6 +1183,50 @@ impl RdpClient {
             .unwrap_or(false)
     }
 
+    /// Handles a failed connection attempt.
+    ///
+    /// Returns `true` when the connection loop must try again — because the graphics pipeline
+    /// fallback adjusted the capability or an automatic reconnection is under way — and `false`
+    /// when the failure is terminal and has been reported to the output channel.
+    async fn handle_connect_failure(
+        &mut self,
+        error: ironrdp_connector::ConnectorError,
+        auto_reconnect_policy: Option<AutoReconnectPolicy>,
+        reconnect_attempt: &mut u32,
+        auto_reconnect_cookie: Option<&ServerAutoReconnect>,
+    ) -> bool {
+        if self.try_graphics_pipeline_fallback(&error) {
+            return true;
+        }
+        if self
+            .try_auto_reconnect(auto_reconnect_policy, reconnect_attempt, auto_reconnect_cookie)
+            .await
+        {
+            return true;
+        }
+        if !self.send_output_event(RdpOutputEvent::ConnectionFailure(error)).await {
+            self.emit_user_initiated_termination();
+        }
+        false
+    }
+
+    /// Advertises the Graphics Pipeline capability and retries when a server refused the
+    /// connection because the client had not advertised it.
+    fn try_graphics_pipeline_fallback(&mut self, error: &ironrdp_connector::ConnectorError) -> bool {
+        if !self.graphics_pipeline_fallback || self.config.connector.support_dyn_vc_gfx_protocol {
+            return false;
+        }
+        if !is_server_negotiation_refusal(error) {
+            return false;
+        }
+
+        debug!(
+            "Server refused the connection without the Graphics Pipeline capability, retrying with it advertised"
+        );
+        self.config.connector.support_dyn_vc_gfx_protocol = true;
+        true
+    }
+
     async fn try_auto_reconnect(
         &mut self,
         policy: Option<AutoReconnectPolicy>,
@@ -1259,6 +1316,23 @@ fn is_transport_session_error(error: &(dyn core::error::Error + 'static)) -> boo
         source = error.source();
     }
     false
+}
+
+/// Whether a connection attempt was refused by the server during negotiation.
+///
+/// A host that refuses a session because of a missing client capability disconnects with an MCS
+/// Provider Ultimatum right after the capability exchange, which the connector reports as a decode
+/// error. Credential failures are excluded: a missing capability cannot cause them, and retrying
+/// them would repeat a failed logon.
+fn is_server_negotiation_refusal(error: &ironrdp_connector::ConnectorError) -> bool {
+    if matches!(
+        error.kind(),
+        ironrdp_connector::ConnectorErrorKind::Credssp(_) | ironrdp_connector::ConnectorErrorKind::AccessDenied
+    ) {
+        return false;
+    }
+
+    error.report().to_string().contains("provider ultimatum")
 }
 
 async fn cancelable_operation<T>(
@@ -4754,6 +4828,42 @@ mod tests {
             ironrdp_connector::custom_err!("read frame", protocol_error)
         );
         assert!(!is_transport_session_error(&protocol_error));
+    }
+
+    /// A host that demands the Graphics Pipeline capability answers the capability exchange with an
+    /// MCS Disconnect Provider Ultimatum, so the fallback must recognize exactly that shape.
+    #[test]
+    fn provider_ultimatum_negotiation_refusals_are_detected() {
+        let frame = ironrdp_core::encode_vec(&ironrdp_pdu::x224::X224(
+            ironrdp_pdu::mcs::McsMessage::DisconnectProviderUltimatum(
+                ironrdp_pdu::mcs::DisconnectProviderUltimatum::from_reason(
+                    ironrdp_pdu::mcs::DisconnectReason::ProviderInitiated,
+                ),
+            ),
+        ))
+        .expect("encode disconnect provider ultimatum");
+        let decode_error = ironrdp_pdu::mcs::decode_send_data_indication(&frame)
+            .expect_err("an ultimatum is not a send data indication");
+
+        let refusal = ironrdp_connector::ConnectorError::new(
+            "decode error",
+            ironrdp_connector::ConnectorErrorKind::Decode(decode_error),
+        );
+        assert!(is_server_negotiation_refusal(&refusal));
+
+        let unrelated = ironrdp_connector::ConnectorError::new(
+            "decode error",
+            ironrdp_connector::ConnectorErrorKind::Decode(
+                ironrdp_pdu::find_size(&[0x01]).expect_err("invalid fast-path action must fail"),
+            ),
+        );
+        assert!(!is_server_negotiation_refusal(&unrelated));
+
+        let denied = ironrdp_connector::ConnectorError::new(
+            "connection rejected",
+            ironrdp_connector::ConnectorErrorKind::AccessDenied,
+        );
+        assert!(!is_server_negotiation_refusal(&denied));
     }
 
     #[test]
