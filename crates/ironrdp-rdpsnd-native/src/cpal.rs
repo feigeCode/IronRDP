@@ -287,6 +287,48 @@ fn config_supports_pcm(range: &SupportedStreamConfigRange, format: &AudioFormat)
     rate >= range.min_sample_rate() && rate <= range.max_sample_rate()
 }
 
+/// Whether any enumerated range advertises an integer PCM sample format.
+///
+/// Some hosts only report float ranges even though the underlying audio API
+/// happily converts integer PCM (cpal 0.17 CoreAudio hardcodes F32, see the
+/// "just use F32 for now" TODO in its `device.rs`). Filtering against such a
+/// list would drop every PCM candidate and leave RDPSND negotiation with an
+/// empty intersection on the server side, i.e. silent playback.
+fn has_integer_pcm_range(configs: &[SupportedStreamConfigRange]) -> bool {
+    configs.iter().any(|range| {
+        matches!(
+            range.sample_format(),
+            SampleFormat::I8
+                | SampleFormat::I16
+                | SampleFormat::I32
+                | SampleFormat::U8
+                | SampleFormat::U16
+                | SampleFormat::U32
+        )
+    })
+}
+
+/// Filter advertised PCM formats against device capabilities, unless the
+/// device only reports float formats (see `has_integer_pcm_range`).
+fn filter_formats_by_device(candidates: Vec<AudioFormat>, configs: &[SupportedStreamConfigRange]) -> Vec<AudioFormat> {
+    if !has_integer_pcm_range(configs) {
+        warn!(
+            "Output device reports no integer PCM formats (float-only enumeration); skipping device filter so RDPSND can negotiate"
+        );
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|format| {
+            if format.format != WaveFormat::PCM {
+                // Codec formats (e.g. Opus) are decoded to PCM before the device.
+                return true;
+            }
+            configs.iter().any(|range| config_supports_pcm(range, format))
+        })
+        .collect()
+}
+
 fn build_output_formats() -> Vec<AudioFormat> {
     let candidates = candidate_output_formats();
     let host = cpal::default_host();
@@ -302,16 +344,7 @@ fn build_output_formats() -> Vec<AudioFormat> {
         }
     };
 
-    candidates
-        .into_iter()
-        .filter(|format| {
-            if format.format != WaveFormat::PCM {
-                // Codec formats (e.g. Opus) are decoded to PCM before the device.
-                return true;
-            }
-            configs.iter().any(|range| config_supports_pcm(range, format))
-        })
-        .collect()
+    filter_formats_by_device(candidates, &configs)
 }
 
 impl Drop for RdpsndBackend {
@@ -647,5 +680,56 @@ impl RxBuffer {
             }
             fill_silence(&mut data[filled..], self.bits_per_sample);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cpal::SupportedBufferSize;
+
+    fn f32_range() -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(2, 44100, 96000, SupportedBufferSize::Unknown, SampleFormat::F32)
+    }
+
+    fn pcm_count(formats: &[AudioFormat]) -> usize {
+        formats.iter().filter(|f| f.format == WaveFormat::PCM).count()
+    }
+
+    /// macOS cpal CoreAudio only enumerates F32 ranges; the device filter must
+    /// be skipped so RDPSND negotiation still has PCM candidates to offer.
+    #[test]
+    fn float_only_device_keeps_all_candidates() {
+        let candidates = candidate_output_formats();
+        let total_pcm = pcm_count(&candidates);
+        assert!(total_pcm > 0);
+
+        let out = filter_formats_by_device(candidates, &[f32_range()]);
+        assert_eq!(
+            pcm_count(&out),
+            total_pcm,
+            "float-only enumeration must not drop PCM candidates"
+        );
+    }
+
+    /// Devices that do report integer PCM still get filtered normally.
+    #[test]
+    fn integer_device_still_filters() {
+        // I16 stereo 44100..48000 keeps only 44100/48000 stereo candidates;
+        // 22050/16000/8000 fall outside the rate range.
+        let narrow = SupportedStreamConfigRange::new(2, 44100, 48000, SupportedBufferSize::Unknown, SampleFormat::I16);
+        let out = filter_formats_by_device(candidate_output_formats(), &[narrow]);
+        let pcm: Vec<_> = out.iter().filter(|f| f.format == WaveFormat::PCM).collect();
+        // stereo 48000 + stereo 44100 + mono 44100; 22050/16000/8000 dropped by rate range
+        assert_eq!(pcm.len(), 3);
+        assert!(pcm.iter().all(|f| (44000..49000).contains(&f.n_samples_per_sec)));
+    }
+
+    #[test]
+    fn empty_enumeration_keeps_all_candidates() {
+        let candidates = candidate_output_formats();
+        let total_pcm = pcm_count(&candidates);
+        let out = filter_formats_by_device(candidates, &[]);
+        assert_eq!(pcm_count(&out), total_pcm);
     }
 }
