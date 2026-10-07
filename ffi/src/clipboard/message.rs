@@ -26,6 +26,9 @@ pub mod ffi {
                 ironrdp::cliprdr::backend::ClipboardMessage::SendFileContentsResponse(_) => {
                     ClipboardMessageType::SendFileContentsResponse
                 }
+                ironrdp::cliprdr::backend::ClipboardMessage::ReleaseFileLock(_) => {
+                    ClipboardMessageType::ReleaseFileLock
+                }
                 ironrdp::cliprdr::backend::ClipboardMessage::Error(_) => ClipboardMessageType::Error,
             }
         }
@@ -94,6 +97,7 @@ pub mod ffi {
         SendInitiatePaste,
         SendFileContentsRequest,
         SendFileContentsResponse,
+        ReleaseFileLock,
         Error,
     }
 

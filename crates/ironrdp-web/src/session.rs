@@ -745,6 +745,10 @@ impl iron_remote_desktop::Session for Session {
                                         cliprdr.submit_file_contents(response)
                                             .context("cliprdr submit file contents")?
                                     ),
+                                    ClipboardMessage::ReleaseFileLock(clip_data_id) => Some(
+                                        cliprdr.release_lock(clip_data_id)
+                                            .context("cliprdr release file lock")?
+                                    ),
                                     ClipboardMessage::Error(e) => {
                                         error!(error = %e, "Clipboard backend error");
                                         None

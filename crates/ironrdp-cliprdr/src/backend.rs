@@ -50,6 +50,20 @@ pub enum ClipboardMessage {
     /// later `FileContentsRequest`s from the remote can be serviced.
     SendInitiateFileCopy(Vec<FileDescriptor>),
 
+    /// Sent by clipboard backend when it no longer needs the File Stream data retained by one
+    /// of its outgoing locks.
+    ///
+    /// Outgoing locks are created while downloading files from the remote; each asks the Shared
+    /// Clipboard Owner to retain the File Stream data ([MS-RDPECLIP] 2.2.4.1). They are otherwise
+    /// released lazily by the inactivity sweep, which means the owner keeps the *source* files
+    /// open — and the user cannot delete or move them — until the lock goes unused for the
+    /// inactivity timeout. A backend that knows the download has finished, failed, or was
+    /// cancelled can release the lock right away with this message instead of waiting.
+    ///
+    /// Implementation should send an `Unlock` PDU for the given lock on `CLIPRDR` SVC when this
+    /// message is received. Releasing a lock that is not held is a no-op.
+    ReleaseFileLock(LockDataId),
+
     /// Failure received from the OS clipboard event loop.
     ///
     /// Client implementation should log/display this error.

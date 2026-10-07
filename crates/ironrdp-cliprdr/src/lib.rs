@@ -1175,6 +1175,49 @@ impl<R: Role> Cliprdr<R> {
         messages
     }
 
+    /// Releases a single outgoing clipboard lock immediately.
+    ///
+    /// Backends call this through [`ClipboardMessage::ReleaseFileLock`] once the download a lock
+    /// was protecting has finished, failed or been cancelled, so the Shared Clipboard Owner can
+    /// drop the File Stream data it retained ([MS-RDPECLIP] 2.2.4.1) without waiting for the
+    /// inactivity sweep in [`Self::drive_timeouts`]. Until the lock is released Windows
+    /// `rdpclip.exe` keeps the *source* files open on the remote machine and the user cannot
+    /// delete or move them.
+    ///
+    /// Releasing a lock that is not held (unknown id, or an id already released) is a no-op and
+    /// produces no PDU, so callers do not have to track lock lifetime themselves.
+    ///
+    /// Unlike [`Self::release_outgoing_locks`], which drops *every* lock before the local side
+    /// takes clipboard ownership, this clears only the state belonging to `clip_data_id` and
+    /// leaves other locks untouched.
+    ///
+    /// [`ClipboardMessage::ReleaseFileLock`]: crate::backend::ClipboardMessage::ReleaseFileLock
+    pub fn release_lock(&mut self, clip_data_id: LockDataId) -> PduResult<CliprdrSvcMessages<R>> {
+        let mut messages = Vec::new();
+        let id = clip_data_id.0;
+
+        if self.outgoing_locks.remove(&id).is_some() {
+            // The remote drops its File Stream data on Unlock, so the snapshot we validated the
+            // download against goes with it.
+            self.locked_remote_file_lists.remove(&id);
+            if self.current_lock_id == Some(id) {
+                self.current_lock_id = None;
+            }
+
+            debug!(clip_data_id = id, "Releasing outgoing lock at the backend's request");
+
+            messages.push(into_cliprdr_message(ClipboardPdu::UnlockData(LockDataId(id))));
+            self.backend.on_outgoing_locks_cleared(&[clip_data_id]);
+        } else {
+            debug!(
+                clip_data_id = id,
+                "Backend asked to release an outgoing lock that is not held"
+            );
+        }
+
+        Ok(messages.into())
+    }
+
     /// Lazily runs periodic cleanup during normal API activity.
     ///
     /// Cleans up expired locks, stale file contents requests, and inactive

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use ironrdp_cliprdr::pdu::{
     Capabilities, ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
     ClipboardPdu, ClipboardProtocolVersion, FileContentsFlags, FileContentsRequest, FileContentsResponse,
-    FileDescriptor, FormatList, PackedFileList,
+    FileDescriptor, FormatList, LockDataId, PackedFileList,
 };
 use ironrdp_cliprdr::{Cliprdr, CliprdrClient, CliprdrState};
 use ironrdp_core::Encode as _;
@@ -334,4 +334,120 @@ fn expire_via_format_list_transitions_state() {
 
     // Bookkeeping: lock still tracked (expired, not removed)
     assert_eq!(cliprdr.__test_outgoing_locks().len(), 1);
+}
+
+// -- Backend-driven release of one specific lock -----------------------
+//
+// The idle sweep above is a fallback. A backend that knows the download it
+// asked a lock for has finished (or failed, or was cancelled) can drop that
+// lock right away with `ClipboardMessage::ReleaseFileLock`, so the remote
+// lets go of the source files without waiting out the inactivity timeout.
+
+/// Helper: build a client whose backend records `on_outgoing_locks_cleared`.
+fn callback_tracking_client(cleared_ids: &Arc<Mutex<Vec<Vec<LockDataId>>>>) -> CliprdrClient {
+    let backend = CallbackTrackingBackend::new(Arc::clone(cleared_ids));
+    let mut cliprdr: CliprdrClient = Cliprdr::with_lock_timeouts(
+        Box::new(backend),
+        core::time::Duration::from_secs(60),
+        core::time::Duration::from_secs(600),
+    );
+    *cliprdr.__test_state_mut() = CliprdrState::Ready;
+    *cliprdr.__test_capabilities_mut() = Capabilities::new(
+        ClipboardProtocolVersion::V2,
+        ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
+            | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES,
+    );
+    cliprdr
+}
+
+#[test]
+fn release_lock_releases_an_active_lock_immediately() {
+    let cleared_ids = Arc::new(Mutex::new(Vec::new()));
+    let mut cliprdr = callback_tracking_client(&cleared_ids);
+    *cliprdr.__test_remote_file_list_mut() = Some(sized_file_list(&[("test.txt", 1000)]));
+
+    let clip_data_id = process_file_format_list(&mut cliprdr);
+    assert!(cleared_ids.lock().unwrap().is_empty());
+
+    // No clock advance at all: the lock is released because the backend said
+    // so, not because it went idle.
+    let messages: Vec<SvcMessage> = Vec::from(cliprdr.release_lock(LockDataId(clip_data_id)).unwrap());
+    assert_eq!(messages.len(), 1, "release must produce exactly one Unlock PDU");
+    decode_pdu!(messages[0] => _bytes, pdu);
+    match pdu {
+        ClipboardPdu::UnlockData(id) => assert_eq!(id.0, clip_data_id),
+        other => panic!("expected UnlockData PDU, got {other:?}"),
+    }
+
+    assert!(!cliprdr.__test_outgoing_locks().contains_key(&clip_data_id));
+    assert_eq!(cliprdr.__test_current_lock_id(), None);
+    assert_eq!(
+        cleared_ids.lock().unwrap().as_slice(),
+        &[vec![LockDataId(clip_data_id)]],
+        "backend must be told which lock was released"
+    );
+}
+
+#[test]
+fn release_lock_is_a_noop_for_an_unknown_lock() {
+    let cleared_ids = Arc::new(Mutex::new(Vec::new()));
+    let mut cliprdr = callback_tracking_client(&cleared_ids);
+    *cliprdr.__test_remote_file_list_mut() = Some(sized_file_list(&[("test.txt", 1000)]));
+
+    let clip_data_id = process_file_format_list(&mut cliprdr);
+
+    let messages: Vec<SvcMessage> = Vec::from(
+        cliprdr
+            .release_lock(LockDataId(clip_data_id.wrapping_add(999)))
+            .unwrap(),
+    );
+    assert!(messages.is_empty(), "an unknown lock must not produce a PDU");
+
+    assert!(cliprdr.__test_outgoing_locks().contains_key(&clip_data_id));
+    assert_eq!(cliprdr.__test_current_lock_id(), Some(clip_data_id));
+    assert!(cleared_ids.lock().unwrap().is_empty());
+}
+
+#[test]
+fn released_lock_is_not_released_again_by_the_sweep() {
+    let cleared_ids = Arc::new(Mutex::new(Vec::new()));
+    let mut cliprdr = callback_tracking_client(&cleared_ids);
+    *cliprdr.__test_remote_file_list_mut() = Some(sized_file_list(&[("test.txt", 1000)]));
+
+    let clip_data_id = process_file_format_list(&mut cliprdr);
+    let _ = cliprdr.release_lock(LockDataId(clip_data_id)).unwrap();
+
+    // Far beyond every timeout: the lock is gone, so the sweep must stay silent
+    // rather than release it a second time.
+    cliprdr
+        .downcast_backend::<CallbackTrackingBackend>()
+        .unwrap()
+        .advance_ms(10_000_000);
+    let messages: Vec<SvcMessage> = Vec::from(cliprdr.drive_timeouts().unwrap());
+    assert!(messages.is_empty(), "a released lock must not be released twice");
+}
+
+#[test]
+fn release_lock_leaves_other_locks_in_place() {
+    let cleared_ids = Arc::new(Mutex::new(Vec::new()));
+    let mut cliprdr = callback_tracking_client(&cleared_ids);
+    *cliprdr.__test_remote_file_list_mut() = Some(sized_file_list(&[("first.txt", 10)]));
+
+    let first = process_file_format_list(&mut cliprdr);
+
+    // A second file copy on the remote: the first lock is only *expired*, it
+    // stays tracked so a download still running against it can finish.
+    let second = process_file_format_list(&mut cliprdr);
+    assert_ne!(first, second, "each file copy must get its own lock id");
+    assert_eq!(cliprdr.__test_outgoing_locks().len(), 2);
+
+    let messages: Vec<SvcMessage> = Vec::from(cliprdr.release_lock(LockDataId(second)).unwrap());
+    assert_eq!(messages.len(), 1, "releasing one lock sends one Unlock PDU");
+
+    assert!(!cliprdr.__test_outgoing_locks().contains_key(&second));
+    assert!(
+        cliprdr.__test_outgoing_locks().contains_key(&first),
+        "other locks must be left alone"
+    );
 }

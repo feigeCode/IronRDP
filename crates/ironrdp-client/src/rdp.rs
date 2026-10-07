@@ -4538,6 +4538,11 @@ fn process_clipboard_message(
                 .submit_file_contents(response)
                 .map_err(|e| ironrdp_session::custom_err!("CLIPRDR", e))?,
         ),
+        ClipboardMessage::ReleaseFileLock(clip_data_id) => Some(
+            cliprdr_client
+                .release_lock(clip_data_id)
+                .map_err(|e| ironrdp_session::custom_err!("CLIPRDR", e))?,
+        ),
         ClipboardMessage::Error(error) => {
             error!("Clipboard backend error: {error}");
             None
