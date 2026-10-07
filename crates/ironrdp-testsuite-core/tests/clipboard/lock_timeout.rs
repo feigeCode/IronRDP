@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use ironrdp_cliprdr::pdu::{
     Capabilities, ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
-    ClipboardPdu, ClipboardProtocolVersion, FileContentsFlags, FileContentsRequest, FileDescriptor, FormatList,
-    PackedFileList,
+    ClipboardPdu, ClipboardProtocolVersion, FileContentsFlags, FileContentsRequest, FileContentsResponse,
+    FileDescriptor, FormatList, PackedFileList,
 };
 use ironrdp_cliprdr::{Cliprdr, CliprdrClient, CliprdrState};
 use ironrdp_core::Encode as _;
@@ -198,6 +198,95 @@ fn max_lifetime_forces_cleanup() {
         1,
         "lock should be cleaned up after max lifetime even with activity"
     );
+    decode_pdu!(messages[0] => _bytes, pdu);
+    match pdu {
+        ClipboardPdu::UnlockData(id) => assert_eq!(id.0, clip_data_id),
+        other => panic!("expected UnlockData PDU, got {other:?}"),
+    }
+    assert!(!cliprdr.__test_outgoing_locks().contains_key(&clip_data_id));
+}
+
+// -- Idle release of still-active locks --------------------------------
+//
+// Regression coverage: an outgoing lock only used to be released when the
+// *remote clipboard changed*, when the local side initiated a file copy, or
+// after the 2h max lifetime. Windows `rdpclip.exe` keeps the source files open
+// for as long as a lock is held ([MS-RDPECLIP] 2.2.4.1, the owner must retain
+// the File Stream data), so copying a file out of the session and then trying
+// to delete it on the remote failed with "the file is open in another program"
+// until something unrelated touched the clipboard.
+
+#[test]
+fn active_lock_released_once_transfer_goes_quiet() {
+    let mut cliprdr = timed_locking_client(200, 10_000);
+    *cliprdr.__test_remote_file_list_mut() = Some(sized_file_list(&[("test.txt", 1000)]));
+
+    let clip_data_id = process_file_format_list(&mut cliprdr);
+
+    // From here on the clipboard never changes: no text FormatList is processed,
+    // which is exactly the situation the regression was about.
+    let messages: Vec<SvcMessage> = Vec::from(cliprdr.drive_timeouts().unwrap());
+    assert_eq!(messages.len(), 0, "fresh lock must not be released");
+    assert!(cliprdr.__test_outgoing_locks().contains_key(&clip_data_id));
+
+    // Idle past the inactivity timeout with no transfer pending.
+    cliprdr.downcast_backend::<LockingBackend>().unwrap().advance_ms(250);
+
+    let messages: Vec<SvcMessage> = Vec::from(cliprdr.drive_timeouts().unwrap());
+    assert_eq!(messages.len(), 1, "idle active lock should be released");
+    decode_pdu!(messages[0] => _bytes, pdu);
+    match pdu {
+        ClipboardPdu::UnlockData(id) => assert_eq!(id.0, clip_data_id),
+        other => panic!("expected UnlockData PDU, got {other:?}"),
+    }
+
+    assert!(!cliprdr.__test_outgoing_locks().contains_key(&clip_data_id));
+    assert_eq!(cliprdr.__test_current_lock_id(), None);
+}
+
+#[test]
+fn active_lock_held_while_a_file_contents_request_is_pending() {
+    let mut cliprdr = timed_locking_client(200, 10_000);
+    let fl = sized_file_list(&[("test.txt", 1000)]);
+    *cliprdr.__test_remote_file_list_mut() = Some(fl.clone());
+    *cliprdr.__test_local_file_list_mut() = Some(fl);
+
+    let clip_data_id = process_file_format_list(&mut cliprdr);
+
+    // Leave a download request unanswered: the transfer is still in progress.
+    let request = FileContentsRequest {
+        stream_id: 7,
+        index: 0,
+        flags: FileContentsFlags::SIZE,
+        position: 0,
+        requested_size: 8,
+        data_id: Some(clip_data_id),
+    };
+    cliprdr.request_file_contents(request).unwrap();
+
+    // Idle far past the inactivity timeout while that request is outstanding.
+    cliprdr.downcast_backend::<LockingBackend>().unwrap().advance_ms(5_000);
+
+    let messages: Vec<SvcMessage> = Vec::from(cliprdr.drive_timeouts().unwrap());
+    assert_eq!(messages.len(), 0, "lock must not be released mid-transfer");
+    assert!(cliprdr.__test_outgoing_locks().contains_key(&clip_data_id));
+
+    // The server answers; the transfer is over, so the lock becomes releasable.
+    let response = FileContentsResponse::new_size_response(7, 1000);
+    let response_pdu = ClipboardPdu::FileContentsResponse(response);
+    let mut buf = vec![0u8; response_pdu.size()];
+    let mut cursor = ironrdp_core::WriteCursor::new(&mut buf);
+    response_pdu.encode(&mut cursor).unwrap();
+    cliprdr.process(&buf).unwrap();
+    assert!(
+        cliprdr.__test_sent_file_contents_requests().is_empty(),
+        "answering the request must drain the pending set"
+    );
+
+    cliprdr.downcast_backend::<LockingBackend>().unwrap().advance_ms(250);
+
+    let messages: Vec<SvcMessage> = Vec::from(cliprdr.drive_timeouts().unwrap());
+    assert_eq!(messages.len(), 1, "lock should be released once nothing is pending");
     decode_pdu!(messages[0] => _bytes, pdu);
     match pdu {
         ClipboardPdu::UnlockData(id) => assert_eq!(id.0, clip_data_id),

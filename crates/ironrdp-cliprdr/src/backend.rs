@@ -221,15 +221,20 @@ pub trait CliprdrBackend: AsAny + core::fmt::Debug + Send {
         let _ = (files, clip_data_id);
     }
 
-    /// Called when expired outgoing clipboard locks are cleaned up.
+    /// Called when outgoing clipboard locks are cleaned up.
     ///
-    /// This is triggered by [`crate::Cliprdr::drive_timeouts`] after a lock has been
-    /// in the Expired state and either the inactivity timeout or max lifetime has elapsed.
-    /// Locks transition to Expired when a new FormatList PDU is received (clipboard change);
-    /// this callback fires later when the cleanup actually removes them.
+    /// This is triggered by [`crate::Cliprdr::drive_timeouts`] for locks that
+    /// either stayed in the `Expired` state long enough (the inactivity timeout
+    /// or max lifetime elapsed), or were still `Active` but had no file contents
+    /// request in flight for the inactivity timeout — i.e. their transfer
+    /// finished and nothing needed the retained File Stream data any more.
+    /// Locks transition to `Expired` when a new FormatList PDU is received
+    /// (clipboard change); that callback fires later when the cleanup actually
+    /// removes them.
     ///
-    /// **Use case**: Backends can use this to clean up any associated lock state, cancel
-    /// ongoing downloads, or update UI to reflect that the lock is no longer valid.
+    /// **Use case**: Backends can use this to clean up any associated lock state,
+    /// cancel ongoing uploads, or update UI to reflect that the lock is no longer
+    /// valid.
     ///
     /// ## Parameters
     ///

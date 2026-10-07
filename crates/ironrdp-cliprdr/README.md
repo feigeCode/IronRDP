@@ -176,7 +176,7 @@ Backends receive the `clipDataId` and can pass it to `request_file_contents()` v
 #### Driving Timeouts
 
 Callers must drive [`Cliprdr::drive_timeouts()`] from a periodic timer in their event loop (e.g., every 5 seconds). This method processes:
-- **Expired locks**: Sends Unlock PDUs for locks past their inactivity timeout or max lifetime
+- **Locks**: Sends Unlock PDUs for locks past their inactivity timeout or max lifetime, and for locks that are still active but whose transfer has gone quiet
 - **Stale requests**: Cleans up file contents requests older than the transfer timeout
 - **Abandoned uploads**: Prunes locked file list snapshots with no recent activity
 
@@ -189,8 +189,15 @@ for msg in messages {
 ```
 
 Locks are cleaned up based on:
-- **Inactivity timeout** (60s default): No FileContentsRequest activity after lock expires
+- **Inactivity timeout** (60s default): No FileContentsRequest activity after the lock expires, or after a still-active lock's transfer went quiet
 - **Maximum lifetime** (2h default): Force cleanup regardless of activity
+
+Releasing an idle *active* lock matters in practice: the Shared Clipboard Owner must retain the
+File Stream data for as long as the lock is held ([MS-RDPECLIP] 2.2.4.1), and Windows
+`rdpclip.exe` implements that by keeping the source files open on the remote machine. Without
+this rule, copying a file out of the session and then deleting it on the remote fails with "the
+file is open in another program" until something else changes the clipboard. A lock is never
+released while a file contents request is in flight, so this cannot abort an ongoing transfer.
 
 #### Customizing Lock Timeouts
 

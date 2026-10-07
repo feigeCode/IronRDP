@@ -550,9 +550,13 @@ impl<R: Role> Cliprdr<R> {
     /// Creates new CLIPRDR processor with default timeout policy
     ///
     /// Defaults:
-    /// - Inactivity timeout: 60 seconds (cleanup expired locks with no FileContentsRequest activity)
+    /// - Inactivity timeout: 60 seconds (cleanup locks with no FileContentsRequest activity)
     /// - Max lifetime: 2 hours (force cleanup regardless of activity)
     /// - Transfer timeout: 60 seconds (individual file contents request timeout)
+    ///
+    /// The inactivity timeout applies to locks whose clipboard changed *and* to
+    /// locks that are still active but idle, so a finished file download stops
+    /// holding the remote's File Stream data (see [`Self::drive_timeouts_impl`]).
     ///
     /// Callers must drive [`Self::drive_timeouts()`] from a periodic timer (e.g., every 5 seconds)
     /// to process expired locks and stale transfers.
@@ -568,7 +572,8 @@ impl<R: Role> Cliprdr<R> {
     /// Creates new CLIPRDR processor with custom lock timeout policy
     ///
     /// ## Parameters
-    /// - `inactivity_timeout`: Cleanup expired locks with no FileContentsRequest for this duration
+    /// - `inactivity_timeout`: Cleanup locks with no FileContentsRequest for this duration.
+    ///   Applies to expired locks, and to still-active locks once their transfer has gone quiet
     /// - `max_lifetime`: Force cleanup after this duration regardless of activity
     ///
     /// Callers must drive [`Self::drive_timeouts()`] from a periodic timer (e.g., every 5 seconds).
@@ -588,7 +593,8 @@ impl<R: Role> Cliprdr<R> {
     /// Creates new CLIPRDR processor with full configuration control
     ///
     /// ## Parameters
-    /// - `inactivity_timeout`: Cleanup expired locks with no FileContentsRequest for this duration
+    /// - `inactivity_timeout`: Cleanup locks with no FileContentsRequest for this duration.
+    ///   Applies to expired locks, and to still-active locks once their transfer has gone quiet
     /// - `max_lifetime`: Force cleanup after this duration regardless of activity
     /// - `transfer_timeout`: Timeout for individual file contents requests and upload inactivity
     ///
@@ -1084,10 +1090,15 @@ impl<R: Role> Cliprdr<R> {
     /// set of file downloads. When the remote clipboard changes, we must NOT
     /// immediately send Unlock PDUs because that would abort in-flight downloads
     /// from the previous clipboard. Instead, locks transition to `Expired` state
-    /// and remain in `outgoing_locks`. The two-tier cleanup
-    /// ([`cleanup_expired_locks`]) sends Unlock PDUs only when a lock has been
-    /// inactive for `lock_inactivity_timeout` (no `FileContentsRequest` activity)
-    /// or exceeds `lock_max_lifetime`.
+    /// and remain in `outgoing_locks`. The cleanup in [`Self::drive_timeouts_impl`]
+    /// sends Unlock PDUs only when a lock has been inactive for
+    /// `lock_inactivity_timeout` (no `FileContentsRequest` activity) or exceeds
+    /// `lock_max_lifetime`.
+    ///
+    /// This transition is *not* the only way out for an outgoing lock: a lock that
+    /// is still `Active` is released once its transfer has been quiet for
+    /// `lock_inactivity_timeout`, so a finished download does not pin the remote's
+    /// File Stream data until the clipboard happens to change.
     #[cfg_attr(feature = "__test", visibility::make(pub))]
     fn expire_all_locks(&mut self) {
         if self.outgoing_locks.is_empty() {
@@ -1174,7 +1185,8 @@ impl<R: Role> Cliprdr<R> {
     ///
     /// This method performs three cleanup sweeps:
     /// 1. **Outgoing locks**: Sends Unlock PDUs for locks that have exceeded their inactivity
-    ///    timeout (default 60s) or max lifetime (default 2h)
+    ///    timeout (default 60s) or max lifetime (default 2h), and for locks that are still
+    ///    active but whose transfer has gone quiet (see [`Self::drive_timeouts_impl`])
     /// 2. **Stale requests**: Removes file contents requests older than `transfer_timeout` and
     ///    sends synthetic error responses to the backend
     /// 3. **Abandoned uploads**: Cleans up locked file list snapshots with no recent activity
@@ -1204,7 +1216,7 @@ impl<R: Role> Cliprdr<R> {
         let inactivity_timeout_ms = u64::try_from(self.lock_inactivity_timeout.as_millis()).unwrap_or(u64::MAX);
         let max_lifetime_ms = u64::try_from(self.lock_max_lifetime.as_millis()).unwrap_or(u64::MAX);
         let mut messages = Vec::new();
-        let mut expired_ids = Vec::new();
+        let mut release_ids = Vec::new();
 
         // Collect locks that should be cleaned up
         for (clip_data_id, lock) in &self.outgoing_locks {
@@ -1219,7 +1231,7 @@ impl<R: Role> Cliprdr<R> {
                         inactive_secs = time_since_activity_ms / 1000,
                         "Lock inactive, sending Unlock PDU"
                     );
-                    expired_ids.push(*clip_data_id);
+                    release_ids.push(*clip_data_id);
                     continue;
                 }
 
@@ -1230,7 +1242,7 @@ impl<R: Role> Cliprdr<R> {
                         lifetime_secs = total_lifetime_ms / 1000,
                         "Lock exceeded maximum lifetime, forcing cleanup"
                     );
-                    expired_ids.push(*clip_data_id);
+                    release_ids.push(*clip_data_id);
                     continue;
                 }
 
@@ -1241,40 +1253,77 @@ impl<R: Role> Cliprdr<R> {
                     total_lifetime_secs = total_lifetime_ms / 1000,
                     "Expired lock still within timeout window"
                 );
+                continue;
+            }
+
+            // Rule 3: Release a still-active lock once its transfer has gone quiet.
+            //
+            // Rules 1 and 2 only ever fire for `LockState::Expired` locks, i.e. locks whose
+            // clipboard *changed*. An `Active` lock is therefore held until the remote
+            // clipboard changes, until the local side initiates a file copy
+            // ([`Self::release_outgoing_locks`]), or until the process exits. For a plain
+            // "copy a file out of the session" that never happens: nothing else touches the
+            // clipboard, so the lock is held forever.
+            //
+            // Windows `rdpclip.exe` retains the File Stream data for as long as the lock is
+            // held ([MS-RDPECLIP] 2.2.4.1), which keeps the *source* files open on the remote
+            // machine; the user then cannot delete or move them ("the file is open in another
+            // program"). Releasing the lock lets the owner drop that data.
+            //
+            // A lock is never released while a file contents request is pending anywhere, so
+            // this cannot abort a transfer in progress -- that would make the server reject
+            // the next chunk, which still carries the now-dead `clipDataId`. The
+            // `lock_inactivity_timeout` window additionally covers the gap between a response
+            // arriving and the caller issuing its next request.
+            //
+            // Deliberately *not* bounded by `lock_max_lifetime`: unlike an expired lock, an
+            // active one may legitimately stay busy for hours while a huge file downloads,
+            // and cutting it off would abort that transfer.
+            let time_since_activity_ms = now.saturating_sub(lock.last_used_at_ms);
+            if matches!(lock.state, LockState::Active)
+                && self.sent_file_contents_requests.is_empty()
+                && inactivity_timeout_ms <= time_since_activity_ms
+            {
+                debug!(
+                    clip_data_id,
+                    inactive_secs = time_since_activity_ms / 1000,
+                    "Idle active lock, sending Unlock PDU"
+                );
+                release_ids.push(*clip_data_id);
             }
         }
 
         // Remove and send Unlock for each
-        for clip_data_id in &expired_ids {
+        for clip_data_id in &release_ids {
             if let Some(_lock) = self.outgoing_locks.remove(clip_data_id) {
                 // The remote releases its File Stream data on Unlock, so the
                 // snapshot we validated against goes with it.
                 self.locked_remote_file_lists.remove(clip_data_id);
-                debug!(clip_data_id, "Removed expired lock from tracking");
+                debug!(clip_data_id, "Removed released lock from tracking");
                 let pdu = ClipboardPdu::UnlockData(LockDataId(*clip_data_id));
                 messages.push(into_cliprdr_message(pdu));
             }
         }
 
         // Log cleanup summary
-        if !expired_ids.is_empty() {
+        if !release_ids.is_empty() {
             debug!(
-                count = expired_ids.len(),
-                clip_data_ids = ?expired_ids,
+                count = release_ids.len(),
+                clip_data_ids = ?release_ids,
                 "Automatic lock cleanup completed"
             );
         }
 
-        // Clear current_lock_id if it was expired
+        // Clear current_lock_id if the lock behind it was released
         if let Some(current_id) = self.current_lock_id {
-            if expired_ids.contains(&current_id) {
+            if release_ids.contains(&current_id) {
                 self.current_lock_id = None;
             }
         }
 
-        // Notify backend of timeout-expired locks
-        if !expired_ids.is_empty() {
-            let lock_ids: Vec<LockDataId> = expired_ids.iter().map(|id| LockDataId(*id)).collect();
+        // Notify backend of released locks
+        if !release_ids.is_empty() {
+            let lock_ids: Vec<LockDataId> = release_ids.iter().map(|id| LockDataId(*id)).collect();
             self.backend.on_outgoing_locks_cleared(&lock_ids);
         }
 
