@@ -1220,9 +1220,7 @@ impl RdpClient {
             return false;
         }
 
-        debug!(
-            "Server refused the connection without the Graphics Pipeline capability, retrying with it advertised"
-        );
+        debug!("Server refused the connection without the Graphics Pipeline capability, retrying with it advertised");
         self.config.connector.support_dyn_vc_gfx_protocol = true;
         true
     }
@@ -5669,12 +5667,19 @@ mod tests {
         assert_eq!(coalesced, vec![rect(0, 0, 2723, 1663)]);
         let packed: u64 = coalesced.iter().map(region_area).sum();
         let naive: u64 = regions.iter().map(region_area).sum();
-        assert!(packed * 3 <= naive * 2, "packed {packed} pixels vs {naive} shipped before");
+        assert!(
+            packed * 3 <= naive * 2,
+            "packed {packed} pixels vs {naive} shipped before"
+        );
     }
 
     #[test]
     fn a_contained_band_does_not_grow_the_batch_it_joins() {
-        let regions = vec![rect(0, 0, 2723, 1343), rect(0, 1280, 2723, 1529), rect(0, 1344, 2723, 1529)];
+        let regions = vec![
+            rect(0, 0, 2723, 1343),
+            rect(0, 1280, 2723, 1529),
+            rect(0, 1344, 2723, 1529),
+        ];
 
         assert_eq!(coalesce_damage_regions(&regions), vec![rect(0, 0, 2723, 1529)]);
     }
@@ -5708,7 +5713,10 @@ mod tests {
         let coalesced = coalesce_damage_regions(&regions);
 
         assert_eq!(coalesced.len(), 1);
-        assert_eq!(coalesced[0], rect(0, 0, 15, (MAX_DAMAGE_REGIONS_PER_BATCH as u16) * 8 + 3));
+        assert_eq!(
+            coalesced[0],
+            rect(0, 0, 15, (MAX_DAMAGE_REGIONS_PER_BATCH as u16) * 8 + 3)
+        );
     }
 
     #[test]
